@@ -1,0 +1,6 @@
+PyQt6  # 支持详细模型适配和模型配置文件动态加载
+playwright
+pandas
+openpyxl
+Pillow
+qiniu 

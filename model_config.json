@@ -1,0 +1,12 @@
+{
+  "poe": {
+    "gpt-4.1": "https://poe.com/GPT-4-1",
+    "Claude3.7": "https://poe.com/Claude-3.7-Sonnet",
+    "Claude-3.5-Sonnet-June": "https://poe.com/Claude-3.5-Sonnet-June"
+  },
+  "monica": {
+    "gpt-4.1": "https://monica.im/home/chat/GPT-4.1/gpt_4_1",
+    "Claude3.7": "https://monica.im/home/chat/Claude%203.7%20Sonnet/claude_3_7_sonnet",
+    "Gemini-Pro": "https://monica.im/home/chat/Gemini-Pro/gemini_pro"
+  }
+} 
