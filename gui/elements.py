@@ -30,6 +30,7 @@ def get_elements(platforms=None, model_map=None):
         'continue_prompt_edit': QTextEdit(),
         'open_browser_btn': QPushButton('打开浏览器'),
         'start_btn': QPushButton('开始运行'),
+        'headless_checkbox': QCheckBox('无头模式 (后台静默运行)'),
     }
     # 选项初始化
     if platforms:
@@ -45,4 +46,5 @@ def get_elements(platforms=None, model_map=None):
     elements['continue_prompt_edit'].setMinimumWidth(400)
     elements['prompt_edit'].setMinimumHeight(60)
     elements['continue_prompt_edit'].setMinimumHeight(60)
+    elements['headless_checkbox'].setToolTip('勾选后，浏览器将不会显示界面，适合在服务器或需要稳定后台执行时使用。')
     return elements 

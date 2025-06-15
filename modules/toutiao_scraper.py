@@ -5,6 +5,8 @@ import logging
 import random
 from typing import List, Dict, Any
 from .browser_manager import BrowserManager
+from .image_handler import ImageHandler
+from .qiniu_config import QiniuConfig
 import traceback
 
 
@@ -36,34 +38,32 @@ class ToutiaoScraper:
             # 防止日志向上传播到根日志器
             self.logger.propagate = False
     
-    def scrape_articles_and_images(self, keyword):
+    def scrape_articles_and_images(self, keyword, scrape_articles=True, scrape_images=True):
         """
-        公开的主方法，用于抓取文章和图片链接。
-        抓取成功返回True，失败返回False。
+        公开的主方法，用于根据需要抓取文章和/或图片链接。
         """
         try:
-            # 首先，导航到今日头条首页
             if not self.navigate_to_toutiao():
                 self.logger.error("无法打开今日头条首页，抓取任务中止。")
                 return False
 
-            # 清理旧文件
-            if self.config.get('enable_article_collect'):
+            # 根据指令清理旧文件
+            if scrape_articles:
                 self._clear_file("article.txt")
-            if self.config.get('enable_image_collect'):
+            if scrape_images:
                 self._clear_file("picture.txt")
 
-            # 抓取文章数据（包含内容和图片链接）
+            # 抓取文章数据（总是需要抓取，因为图片链接在文章内）
             articles_data = self.search_articles(keyword, self.config.get('article_count', 5))
             if not articles_data:
                 self.logger.warning(f"未能根据关键词 '{keyword}' 抓取到任何文章数据。")
-                return False # 返回False表示未抓取到任何内容
+                return False 
 
-            # 根据配置分别保存文章和图片
-            if self.config.get('enable_article_collect'):
+            # 根据指令分别保存文章和图片
+            if scrape_articles:
                 self._save_articles_content(articles_data)
 
-            if self.config.get('enable_image_collect'):
+            if scrape_images:
                 self._save_images_links(articles_data)
             
             self.logger.info("头条抓取工作流程成功完成。")
@@ -85,21 +85,65 @@ class ToutiaoScraper:
             self.logger.info("抓取到的文章内容为空。")
 
     def _save_images_links(self, articles_data):
-        """从抓取的数据中提取并保存图片链接。"""
+        """
+        从抓取的数据中提取、处理图片并保存七牛云链接。
+        """
         all_images = []
         for article in articles_data:
             all_images.extend(article.get('images', []))
         
         max_images = self.config.get('image_count', 3)
-        images_to_save = all_images[:max_images]
+        images_to_process = all_images[:max_images]
 
-        if images_to_save:
-            with open("picture.txt", "w", encoding='utf-8') as f:
-                for url in images_to_save:
-                    f.write(f"![]({url})\n")
-            self.logger.info(f"已将 {len(images_to_save)} 个图片链接保存到 picture.txt")
-        else:
+        if not images_to_process:
             self.logger.info("未抓取到任何图片链接。")
+            return
+
+        # 独立加载七牛云配置
+        qiniu_loader = QiniuConfig()
+        is_valid, message = qiniu_loader.validate()
+
+        if not is_valid:
+            self.logger.warning(message)  # 打印来自validate()的详细错误信息
+            return
+
+        # 初始化图片处理器
+        qiniu_config = qiniu_loader.get_config()
+        image_handler = ImageHandler(
+            access_key=qiniu_config.get('access_key'),
+            secret_key=qiniu_config.get('secret_key'),
+            bucket_name=qiniu_config.get('bucket_name'),
+            domain=qiniu_config.get('domain')
+        )
+        
+        qiniu_links = []
+        # 从主配置中读取裁剪像素值
+        crop_pixels = self.config.get('crop_bottom_pixels', 0)
+        
+        for i, url in enumerate(images_to_process):
+            try:
+                self.logger.info(f"--- [图片 {i+1}/{len(images_to_process)}] 开始处理: {url} ---")
+                
+                # 使用ImageHandler的集成方法处理图片
+                qiniu_link = image_handler.process_and_upload_image(url, crop_bottom_pixels=crop_pixels)
+                
+                if qiniu_link:
+                    qiniu_links.append(qiniu_link)
+                    self.logger.info(f"图片成功上传到七牛云: {qiniu_link}")
+                else:
+                    self.logger.warning(f"图片处理或上传失败，跳过: {url}")
+
+            except Exception as e:
+                self.logger.error(f"处理单张图片时发生未知错误: {url}, 错误: {e}")
+                traceback.print_exc()
+
+        if qiniu_links:
+            with open("picture.txt", "w", encoding='utf-8') as f:
+                for link in qiniu_links:
+                    f.write(f"![Image]({link})\n")
+            self.logger.info(f"已将 {len(qiniu_links)} 个七牛云图片链接（Markdown格式）保存到 picture.txt")
+        else:
+            self.logger.warning("所有图片处理/上传均失败，picture.txt 为空。")
 
     def load_config(self, config_file):
         """加载配置文件"""
@@ -184,6 +228,7 @@ class ToutiaoScraper:
         """导航到今日头条"""
         try:
             self.browser_manager.navigate_to("https://www.toutiao.com/")
+            self.browser_manager.close_other_tabs()  # 清理其他标签页
             time.sleep(3)
             self._check_for_captcha() # 检查首页加载后是否有验证码
             self.logger.info("成功导航到今日头条")
@@ -196,98 +241,71 @@ class ToutiaoScraper:
         """搜索文章并抓取内容"""
         try:
             self.logger.info(f"搜索关键词: {keyword}")
-            
-            # 查找搜索框并输入关键词
+
+            # --- 搜索操作 ---
             search_input_selector = self.config['selectors']['homepage']['search_input']
-            search_input = self.browser_manager.find_element(search_input_selector, timeout=10)
+            search_button_selector = self.config['selectors']['homepage']['search_button']
             
+            # 找到并激活输入框
+            search_input = self.browser_manager.find_element(search_input_selector, timeout=10)
             if not search_input:
                 self.logger.error("未找到搜索框")
                 return []
-            
             self.logger.info("找到搜索框，先点击激活")
-            # 先点击搜索框激活
-            if not self.browser_manager.click_element(search_input):
-                self.logger.error("点击搜索框失败")
-                return []
-            
-            time.sleep(1)
-            
-            # 直接使用type_text输入内容，清空原有内容
+            self.browser_manager.click_element(search_input)
+            time.sleep(2)
+
+            # 输入关键词
             self.logger.info(f"输入搜索关键词: {keyword}")
-            if not self.browser_manager.type_text(search_input, keyword, clear_first=True):
-                self.logger.error("输入关键词失败")
-                return []
-            
-            time.sleep(1)
-            
+            self.browser_manager.type_text(search_input, keyword, clear_first=False)
+            time.sleep(1.5)
+
             # 点击搜索按钮
-            search_button_selector = self.config['selectors']['homepage']['search_button']
-            search_button = self.browser_manager.find_element(search_button_selector, timeout=5)
-            
+            search_button = self.browser_manager.find_element(search_button_selector)
             if not search_button:
                 self.logger.error("未找到搜索按钮")
                 return []
             
+            # --- 标签页切换逻辑 ---
+            self.logger.info("准备点击搜索按钮并处理新标签页...")
+            tabs_before = self.browser_manager.get_all_tabs()
+            tab_ids_before = {tab['id'] for tab in tabs_before} if tabs_before else set()
+
             self.logger.info("点击搜索按钮")
-            if not self.browser_manager.click_element(search_button):
-                self.logger.error("点击搜索按钮失败")
-                # 检查是否因为验证码
-                self._check_for_captcha()
-                return []
-            
-            # 等待并检测新标签页
-            time.sleep(3)
-            
-            # 查找搜索结果标签页
-            search_tab_index = self.browser_manager.find_tab_by_url("so.toutiao.com")
-            if search_tab_index != -1:
-                self.logger.info(f"找到搜索结果标签页，切换到标签页 {search_tab_index}")
-                if not self.browser_manager.switch_to_tab(search_tab_index):
-                    self.logger.error("切换到搜索结果标签页失败")
-                    return []
+            self.browser_manager.click_element(search_button)
+            time.sleep(3) # 等待新标签页出现
+
+            tabs_after = self.browser_manager.get_all_tabs()
+            tab_ids_after = {tab['id'] for tab in tabs_after} if tabs_after else set()
+
+            new_tab_ids = tab_ids_after - tab_ids_before
+            if new_tab_ids:
+                new_tab_id = new_tab_ids.pop()
+                self.logger.info(f"检测到新的搜索结果标签页，ID: {new_tab_id}。正在切换...")
+                self.browser_manager.switch_to_tab_by_id(new_tab_id)
+                time.sleep(2) # 等待新标签页内容加载
             else:
-                self.logger.warning("未找到搜索结果标签页，使用当前页面")
-            
-            time.sleep(2)
-            
-            # 检查是否需要点击"资讯"标签
-            self._check_for_captcha() # 点击前检查
+                self.logger.warning("未检测到新标签页，将继续在当前标签页操作。")
+
+            # --- 后续操作 ---
+            # 切换到"资讯"分类（如果需要）
             news_tab_selector = self.config['selectors']['search_results']['news_tab']
-            if self.browser_manager.find_element(news_tab_selector, timeout=5):
-                self.logger.info("切换到资讯标签")
-                if self.browser_manager.click_element(news_tab_selector):
-                    time.sleep(3)  # 等待页面刷新
-                    self.logger.info("资讯标签点击成功，页面已刷新")
-                else:
-                    self.logger.warning("点击资讯标签失败")
+            if self.browser_manager.click_element_by_xpath(news_tab_selector):
+                self.logger.info("已切换到'资讯'分类。")
+                time.sleep(2)
+            else:
+                self.logger.warning("未能切换到'资讯'分类，可能页面结构已改变或当前已是资讯页。")
             
-            # 等待页面稳定后重新获取当前URL
-            time.sleep(2)
-            current_url = self.browser_manager.get_current_url()
-            self.logger.info(f"当前页面URL: {current_url}")
+            # 后续的抓取逻辑...
+            articles_data = self._extract_articles_from_current_page(max_articles)
             
-            # 开始抓取文章 - 重构翻页逻辑
-            self.logger.info("开始抓取第 1 页的搜索结果")
-            articles = self._extract_articles_from_current_page(max_articles)
-            
-            # 如果第一页文章不足，则翻页
-            if len(articles) < max_articles:
-                self.logger.info("第一页文章数不足，尝试翻页...")
-                if self._go_to_next_page():
-                    self.logger.info("成功翻至第 2 页，继续抓取...")
-                    time.sleep(3) # 等待第二页加载
-                    remaining_articles_needed = max_articles - len(articles)
-                    more_articles = self._extract_articles_from_current_page(remaining_articles_needed)
-                    articles.extend(more_articles)
-                else:
-                    self.logger.info("无法翻页或已到最后一页。")
-            
-            self.logger.info(f"搜索完成，共抓取到 {len(articles)} 篇文章")
-            return articles
+            if not articles_data:
+                 self.logger.warning("在当前页面未能抓取到任何文章。")
+
+            return articles_data
             
         except Exception as e:
-            self.logger.error(f"搜索文章失败: {e}")
+            self.logger.error(f"搜索文章时出错: {e}", exc_info=True)
             return []
     
     def _extract_articles_from_current_page(self, max_count):
@@ -562,83 +580,106 @@ class ToutiaoScraper:
             return "无标题"
     
     def _extract_article_content(self):
-        """提取文章内容"""
-        try:
-            # 使用用户提供的正确XPath选择器
-            content_selectors = [
-                "//article[@class='syl-article-base syl-page-article tt-article-content syl-device-pc']",
-                "//*[@id='root']/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article",
-                "//article",
-                "//*[contains(@class, 'article-content')]",
-                "//*[contains(@class, 'content')]"
-            ]
-            
-            for selector in content_selectors:
-                element = self.browser_manager.find_element(selector, timeout=3)
-                if element:
-                    content = self.browser_manager.get_element_text(element)
-                    if content and len(content.strip()) > 50:  # 内容长度要求
-                        self.logger.info(f"使用选择器 {selector} 成功提取文章内容，长度: {len(content)}")
-                        return content.strip()
-            
-            return ""
-            
-        except Exception as e:
-            self.logger.error(f"提取内容失败: {e}")
-            return ""
+        """
+        在当前文章页面中提取正文内容。
+        该版本采用健壮策略：尝试多种选择器。
+        """
+        self.logger.info("开始提取文章正文内容...")
+        
+        # 1. 从配置文件获取内容选择器列表
+        selectors = self.config.get('selectors', {}).get('article_page', {}).get('content_containers', [])
+        if not selectors:
+            self.logger.error("配置文件中未定义 'content_containers'。")
+            return None
+
+        # 2. 遍历所有选择器寻找内容
+        for selector in selectors:
+            try:
+                # 使用JS脚本提取文本内容，更稳定
+                escaped_selector = selector.replace('"', '\\"')
+                js_script = f"""
+                (function() {{
+                    var element = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    return element ? element.innerText : null;
+                }})()
+                """
+                content = self.browser_manager.execute_script(js_script)
+
+                if content and isinstance(content, str) and len(content.strip()) > 100:
+                    self.logger.info(f"使用选择器 '{selector}' 成功提取到长度为 {len(content)} 的内容。")
+                    return content.strip()
+            except Exception as e:
+                self.logger.warning(f"使用选择器 '{selector}' 提取内容时出错: {e}")
+                continue
+        
+        self.logger.error("未能使用任何选择器提取到有效的文章内容。")
+        return None
     
     def _extract_article_images(self):
-        """提取文章图片 - 最终修复版，解码URL并使用快照模式"""
-        try:
-            self.logger.info("开始执行最终修复版的图片提取脚本...")
-            # 不再在此处限制数量，收集所有找到的图片
-            # max_images = self.config.get('scraping', {}).get('max_images', 5)
-            
-            # 用户指定的精确XPath
-            xpath = "//*[@id='root']/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article/div/img"
-            escaped_xpath = xpath.replace('"', '\\"')
+        """
+        在当前文章页面中提取所有图片链接。
+        该版本恢复了稳健的策略：滚动页面、尝试多种选择器、检查多种属性。
+        """
+        self.logger.info("开始提取文章图片...")
+        image_urls = set()
 
-            script = f"""
-            (function() {{
-                const images = new Set();
-                const xpath = "{escaped_xpath}";
-                
-                // 使用 snapshot 模式，更稳定
-                const query = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                
-                for (let i = 0; i < query.snapshotLength; i++) {{
-                    let img = query.snapshotItem(i);
-                    let src = img.currentSrc || img.src;
+        # 1. 滚动页面以触发懒加载
+        self.logger.info("滚动页面以加载所有图片...")
+        self.browser_manager.scroll_to_bottom(steps=15, delay=0.3)
+        time.sleep(3)  # 等待图片资源加载
 
-                    if (!src || src.startsWith('data:image')) continue;
-                    
-                    // 关键：解码HTML实体
-                    src = src.replace(/&amp;/g, '&');
-
-                    try {{
-                        const fullUrl = new URL(src, window.location.href).href;
-                        images.add(fullUrl);
-                    }} catch (e) {{
-                        // 无效URL
-                    }}
-                }}
-                
-                return Array.from(images);
-            }})()
-            """
-            
-            image_urls = self.browser_manager.execute_script(script)
-            
-            if image_urls:
-                self.logger.info(f"脚本提取完成，共找到 {len(image_urls)} 张有效图片。")
-                return image_urls
-            else:
-                self.logger.warning("最终修复版的图片提取脚本未能找到任何有效图片。")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"提取图片流程(最终修复版)出错: {e}")
+        # 2. 从配置文件获取图片选择器列表
+        selectors = self.config.get('selectors', {}).get('article_page', {}).get('image_selectors', [])
+        if not selectors:
+            self.logger.error("配置文件中未定义 'image_selectors'。")
             return []
+
+        self.logger.info(f"将要尝试的选择器: {selectors}")
+
+        # 3. 遍历所有选择器寻找图片元素
+        for selector in selectors:
+            try:
+                # 使用JS脚本一次性提取所有符合条件的图片URL，效率更高
+                escaped_selector = selector.replace('"', '\\"')
+                js_script = f"""
+                (function() {{
+                    const urls = new Set();
+                    const query = document.evaluate("{escaped_selector}", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                    
+                    for (let i = 0; i < query.snapshotLength; i++) {{
+                        let img = query.snapshotItem(i);
+                        // 尝试从多个属性获取URL，这是处理懒加载的关键
+                        for (const attr of ['src', 'data-src', 'data-original', 'data-original-src']) {{
+                            let url = img.getAttribute(attr);
+                            if (url && url.startsWith('http')) {{
+                                // 清洗URL，去掉查询参数
+                                const cleanedUrl = url.split('?')[0];
+                                if (cleanedUrl.endsWith('.jpg') || cleanedUrl.endsWith('.jpeg') || cleanedUrl.endsWith('.png') || cleanedUrl.endsWith('.gif')) {{
+                                    urls.add(cleanedUrl);
+                                    break; // 找到有效URL后，不再检查此元素的其他属性
+                                }}
+                            }}
+                        }}
+                    }}
+                    return Array.from(urls);
+                }})()
+                """
+                urls_from_script = self.browser_manager.execute_script(js_script)
+                
+                if urls_from_script:
+                    self.logger.info(f"使用选择器 '{selector}' 找到了 {len(urls_from_script)} 张图片。")
+                    image_urls.update(urls_from_script)
+
+            except Exception as e:
+                self.logger.warning(f"使用选择器 '{selector}' 时出错: {e}")
+                continue
+        
+        if not image_urls:
+            self.logger.warning("未能通过任何选择器提取到有效的图片URL。")
+        
+        final_urls = list(image_urls)
+        self.logger.info(f"提取结束，共找到 {len(final_urls)} 张不重复的图片。")
+        return final_urls
     
     def _go_to_next_page(self):
         """翻到下一页"""

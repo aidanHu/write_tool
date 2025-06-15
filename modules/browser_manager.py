@@ -10,6 +10,7 @@ import psutil
 import random
 from typing import Optional, Dict, Any, List, Union
 import select
+import hashlib
 
 
 class BrowserManager:
@@ -82,6 +83,11 @@ class BrowserManager:
                 "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ]
             
+            if self.headless:
+                self.logger.info("以无头模式启动Chrome...")
+                chrome_args.append("--headless")
+                chrome_args.append("--disable-gpu") # 在某些系统上，无头模式需要禁用GPU
+
             self.logger.info(f"启动Chrome，配置目录: {self.profile_dir}")
             self.chrome_process = subprocess.Popen(
                 chrome_args,
@@ -197,6 +203,7 @@ class BrowserManager:
         try:
             self.logger.info(f"导航到: {url}")
             result = self._send_command("Page.navigate", {"url": url})
+            
             if result and 'result' in result:
                 # 等待页面加载完成
                 max_wait = 15
@@ -1166,178 +1173,168 @@ class BrowserManager:
             return None
 
     def click_element_direct(self, element_info):
-        """直接点击方法，不使用任何JavaScript，使用固定策略"""
-        try:
-            if isinstance(element_info, str):
-                element_info = self.find_element(element_info)
-                if not element_info:
-                    return False
-            
-            element_id = element_info.get('id')
-            if not element_id:
-                return False
-            
-            # 获取视口大小来计算合理的点击位置
-            try:
-                viewport_result = self._send_command("Page.getLayoutMetrics")
-                if viewport_result and 'result' in viewport_result:
-                    viewport = viewport_result['result']['layoutViewport']
-                    viewport_width = viewport['clientWidth']
-                    viewport_height = viewport['clientHeight']
-                else:
-                    viewport_width = 1200
-                    viewport_height = 800
-            except:
-                viewport_width = 1200
-                viewport_height = 800
-            
-            # 使用固定的点击策略：根据元素在页面中的位置计算点击坐标
-            # 假设搜索结果在页面中央区域垂直排列
-            element_text = element_info.get('textContent', '')
-            
-            # 根据元素文本内容的哈希值来确定Y坐标，确保不同元素有不同的点击位置
-            text_hash = hashlib.md5(element_text.encode()).hexdigest()
-            hash_int = int(text_hash[:8], 16)
-            
-            # 计算点击位置：X坐标在页面中央，Y坐标根据元素内容变化
-            center_x = viewport_width / 2
-            base_y = viewport_height * 0.3  # 从页面30%的位置开始
-            offset_y = (hash_int % 300) + 50  # 在50-350像素范围内变化
-            center_y = base_y + offset_y
-            
-            self.logger.info(f"使用直接点击方法，元素: {element_text[:30]}, 位置: ({center_x}, {center_y})")
-            
-            # 移动鼠标到计算的位置
-            self._send_command("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": center_x,
-                "y": center_y
-            })
-            
-            time.sleep(0.1)
-            
-            # 鼠标按下
-            self._send_command("Input.dispatchMouseEvent", {
-                "type": "mousePressed",
-                "x": center_x,
-                "y": center_y,
-                "button": "left",
-                "clickCount": 1
-            })
-            
-            time.sleep(0.05)
-            
-            # 鼠标释放
-            self._send_command("Input.dispatchMouseEvent", {
-                "type": "mouseReleased",
-                "x": center_x,
-                "y": center_y,
-                "button": "left",
-                "clickCount": 1
-            })
-            
-            self.logger.info(f"完成直接点击元素: {element_id}")
+        """尝试使用多种方法直接点击元素，直到成功为止"""
+        if self.click_element_simple(element_info):
             return True
-            
-        except Exception as e:
-            self.logger.error(f"直接点击元素失败: {e}")
-            return False
+        if self.click_element_with_dom_api(element_info):
+            return True
+        if self.click_element_with_mouse(element_info):
+            return True
+        return False
 
     def click_element_by_xpath(self, xpath):
-        """直接使用XPath定位并点击元素，类似影刀的做法"""
+        """
+        通过XPath查找并点击元素，采用多策略方法提高成功率。
+        策略1: 标准 .click()
+        策略2: 派发一个 MouseEvent
+        """
+        self.logger.info(f"尝试以多策略点击XPath元素: {xpath}")
         try:
-            # 使用JavaScript直接通过XPath定位并点击元素
-            click_script = f"""
+            js_code = f"""
             (function() {{
-                // 使用XPath定位元素
-                var result = document.evaluate(
-                    '{xpath}',
+                var element = document.evaluate(
+                    {json.dumps(xpath)},
                     document,
                     null,
                     XPathResult.FIRST_ORDERED_NODE_TYPE,
                     null
-                );
-                
-                var element = result.singleNodeValue;
+                ).singleNodeValue;
+
                 if (!element) {{
-                    return {{success: false, error: 'Element not found'}};
+                    console.error('多策略点击失败：未找到元素。XPath: ' + {json.dumps(xpath)});
+                    return {{'success': false, 'error': 'Element not found'}};
                 }}
-                
-                // 确保元素可见
-                element.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                
-                // 创建并触发点击事件
-                var clickEvent = new MouseEvent('click', {{
-                    view: window,
-                    bubbles: true,
-                    cancelable: true,
-                    button: 0
-                }});
-                
-                element.dispatchEvent(clickEvent);
-                
-                return {{
-                    success: true, 
-                    tagName: element.tagName,
-                    textContent: element.textContent ? element.textContent.substring(0, 50) : '',
-                    href: element.href || ''
-                }};
+
+                // 策略 1: 标准 .click()
+                try {{
+                    if (typeof element.click === 'function') {{
+                        element.click();
+                        console.log('策略1 (.click()) 成功。');
+                        return {{'success': true, 'strategy': 'standard_click'}};
+                    }}
+                }} catch (e) {{
+                    console.warn('策略1 (.click()) 失败: ' + e.message);
+                }}
+
+                // 策略 2: 派发 MouseEvent
+                try {{
+                    console.log('尝试策略2 (MouseEvent)...');
+                    var event = new MouseEvent('click', {{
+                        'view': window,
+                        'bubbles': true,
+                        'cancelable': true
+                    }});
+                    element.dispatchEvent(event);
+                    console.log('策略2 (MouseEvent) 派发成功。');
+                    return {{'success': true, 'strategy': 'mouse_event'}};
+                }} catch (e) {{
+                    console.error('策略2 (MouseEvent) 失败: ' + e.message);
+                    return {{'success': false, 'error': 'MouseEvent dispatch failed: ' + e.message}};
+                }}
             }})()
             """
-            
-            eval_result = self._send_command("Runtime.evaluate", {
-                "expression": click_script,
-                "returnByValue": True
-            })
-            
-            if eval_result and 'result' in eval_result and 'value' in eval_result['result']:
-                result = eval_result['result']['value']
-                if result and result.get('success'):
-                    self.logger.info(f"XPath点击成功: {xpath}")
-                    self.logger.info(f"元素信息: 标签={result.get('tagName')}, 文本={result.get('textContent')}, 链接={result.get('href')}")
-                    return True
-                else:
-                    self.logger.error(f"XPath点击失败: {result.get('error', '未知错误')}")
-                    return False
+            result = self.execute_script(js_code)
+
+            if result and result.get('success'):
+                self.logger.info(f"成功点击XPath元素: {xpath} (使用策略: {result.get('strategy', 'unknown')})")
+                return True
             else:
-                self.logger.error(f"XPath点击脚本执行失败")
+                error_msg = result.get('error', '未知错误') if result else '未知错误'
+                self.logger.error(f"多策略点击失败: {xpath}. 错误: {error_msg}")
                 return False
-                
         except Exception as e:
-            self.logger.error(f"XPath点击异常: {e}")
+            self.logger.error(f"执行多策略点击时出现异常: {xpath}, {e}", exc_info=True)
             return False
 
     def set_input_files(self, selector, file_path):
-        """为文件输入元素设置文件路径（用于上传）"""
+        """
+        为一个<input type="file">元素设置上传文件路径。
+        增加了等待和重试机制，并能自动判断选择器类型。
+        """
+        self.logger.info(f"准备为选择器 '{selector}' 设置文件: {file_path}")
         try:
-            # 1. 获取元素的 nodeId
-            element_info = self.find_element(selector)
-            if not element_info or 'result' not in element_info or 'rootId' not in element_info['result']:
-                self.logger.error(f"无法找到或获取文件输入元素: {selector}")
-                return False
-            
-            node_id = element_info['result']['nodeId']
+            timeout = 5
+            start_time = time.time()
+            node_id = None
+            is_xpath = self._is_xpath(selector)
 
-            # 2. 使用 DOM.setFileInputs 命令
-            result = self._send_command("DOM.setFileInputs", {
-                "nodeId": node_id,
-                "files": [file_path]
+            while time.time() - start_time < timeout:
+                doc = self._send_command('DOM.getDocument', {'depth': -1})
+                if not doc or 'root' not in doc.get('result', {}):
+                    time.sleep(0.5)
+                    continue
+                root_node_id = doc['result']['root']['nodeId']
+
+                # 根据选择器类型使用不同的查询方法
+                if is_xpath:
+                    search_result = self._send_command('DOM.performSearch', {'query': selector})
+                    if search_result and search_result.get('result', {}).get('resultCount', 0) > 0:
+                        search_id = search_result['result']['searchId']
+                        nodes_result = self._send_command('DOM.getSearchResults', {'searchId': search_id, 'fromIndex': 0, 'toIndex': 1})
+                        if nodes_result and nodes_result.get('result', {}).get('nodeIds'):
+                            node_id = nodes_result['result']['nodeIds'][0]
+                else:
+                    query_result = self._send_command('DOM.querySelector', {'nodeId': root_node_id, 'selector': selector})
+                    if query_result and query_result.get('result', {}).get('nodeId'):
+                        node_id = query_result['result']['nodeId']
+                
+                if node_id:
+                    self.logger.info(f"成功找到文件输入元素节点, NodeId: {node_id}")
+                    break
+                
+                self.logger.info(f"暂未找到文件输入元素 '{selector}', 正在重试...")
+                time.sleep(0.5)
+
+            if not node_id:
+                self.logger.error(f"超时! 未能找到文件输入元素: {selector}")
+                return False
+
+            abs_file_path = os.path.abspath(file_path)
+            self.logger.info(f"正在为NodeId {node_id} 设置绝对路径: {abs_file_path}")
+
+            set_files_result = self._send_command('DOM.setFileInputFiles', {
+                'nodeId': node_id,
+                'files': [abs_file_path]
             })
 
-            if result and 'error' not in result:
-                self.logger.info(f"文件路径已成功设置: {file_path}")
+            if set_files_result and 'error' not in set_files_result:
+                self.logger.info(f"文件 '{abs_file_path}' 已成功设置。")
                 return True
             else:
-                error_message = result.get('error', {}).get('message', '未知错误') if result else '无响应'
-                self.logger.error(f"设置文件输入失败: {error_message}")
+                error = set_files_result.get('error', {'message': '未知错误'}) if set_files_result else {'message': '未知错误'}
+                self.logger.error(f"设置文件输入失败: {error.get('message')}")
                 return False
+
         except Exception as e:
-            self.logger.error(f"设置文件输入时出现异常: {e}")
+            self.logger.error(f"设置文件输入时发生异常: {e}", exc_info=True)
             return False
 
+    def scroll_to_bottom(self, steps=10, delay=0.5):
+        """
+        平滑滚动到页面底部以加载所有内容。
+        """
+        self.logger.info("开始滚动到页面底部...")
+        try:
+            js_script = f"""
+            (async () => {{
+                const totalHeight = document.body.scrollHeight;
+                const steps = {steps};
+                const delay = {delay * 1000}; // a-wait-ms in JS needs milliseconds
+                for (let i = 0; i <= steps; i++) {{
+                    window.scrollTo(0, (totalHeight / steps) * i);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }}
+                return true;
+            }})()
+            """
+            self.execute_script(js_script)
+            self.logger.info("滚动完成。")
+        except Exception as e:
+            self.logger.error(f"滚动页面时出错: {e}")
+
     def is_browser_running(self):
-        """检查浏览器是否已连接"""
-        return self.ws is not None
+        """检查Chrome进程是否仍在运行"""
+        return self.chrome_process and self.chrome_process.poll() is None
 
     def _connect_to_browser(self):
         """连接到浏览器的WebSocket"""
@@ -1346,6 +1343,62 @@ class BrowserManager:
                 return True
             time.sleep(1) # 每次连接失败后等待1秒
         return False
+
+    def close_other_tabs(self):
+        """关闭除当前活动标签页外的所有其他标签页"""
+        self.logger.info("正在关闭其他标签页...")
+        try:
+            all_tabs = self.get_all_tabs()
+            current_tab_id = self.current_tab_id
+            
+            if not all_tabs or len(all_tabs) <= 1:
+                self.logger.info("没有其他标签页需要关闭。")
+                return
+
+            for tab in all_tabs:
+                if tab.get('id') != current_tab_id:
+                    self.logger.info(f"正在关闭标签页: {tab.get('title', tab.get('id'))}")
+                    self.close_tab_by_id(tab.get('id'))
+            
+            self.logger.info("已关闭所有其他标签页。")
+        except Exception as e:
+            self.logger.error(f"关闭其他标签页时出错: {e}")
+
+    def switch_to_tab_by_id(self, tab_id: str) -> bool:
+        """通过标签页ID切换到指定标签页"""
+        self.logger.info(f"尝试切换到标签页ID: {tab_id}")
+        try:
+            all_tabs = self.get_all_tabs()
+            target_tab = next((tab for tab in all_tabs if tab.get('id') == tab_id), None)
+
+            if not target_tab:
+                self.logger.error(f"未能找到ID为 '{tab_id}' 的标签页。")
+                return False
+
+            # 如果已经是当前标签页，则无需切换
+            if self.current_tab_id == tab_id and self.is_connected():
+                self.logger.info(f"已经是当前标签页: {tab_id}")
+                return True
+
+            # 关闭旧的WebSocket连接
+            if self.ws and self.ws.connected:
+                self.ws.close()
+
+            # 连接到新标签页的WebSocket
+            ws_url = target_tab.get('webSocketDebuggerUrl')
+            self.ws = websocket.create_connection(ws_url)
+            self.current_tab_id = tab_id
+
+            # 为新标签页启用必要的域
+            self._send_command("Page.enable")
+            self._send_command("DOM.enable")
+            self._send_command("Runtime.enable")
+
+            self.logger.info(f"成功切换到标签页: {target_tab.get('title', tab_id)}")
+            return True
+        except Exception as e:
+            self.logger.error(f"切换到标签页 {tab_id} 失败: {e}")
+            return False
 
 
 

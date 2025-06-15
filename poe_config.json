@@ -7,22 +7,23 @@
     "login": {
       "email_input": "//input[@type='email']",
       "password_input": "//input[@type='password']",
-      "login_button": "//button[contains(text(), 'Log in') or contains(text(), '登录')]",
+      "login_button": "button[data-testid='loginButton']",
       "continue_button": "//button[contains(text(), 'Continue') or contains(text(), '继续')]",
       "google_login": "//button[contains(text(), 'Google')]",
       "captcha_frame": "//iframe[contains(@src, 'recaptcha')]"
     },
     "chat": {
-      "file_upload_button": "//button[@data-button-file-input='true']",
-      "text_input": "//*[@id='__next']/div/div[1]/div/main/div/div/div[1]/div/div/footer/div/div[2]/div[2]/div/div/div[1]/textarea",
-      "send_button": "//button[contains(@class, 'send') or @aria-label='Send message']",
+      "upload_button": "//button[@data-button-file-input='true']",
+      "file_input": "//input[@type='file']",
+      "chat_input": "//textarea[contains(@class, 'textArea')]",
+      "send_button": "//button[@data-button-send='true']",
       "stop_button": "//button[.//span[text()='停止']]",
-      "message_content": "(//*[starts-with(@id, 'message-')]/div[2]/div[2]/div/div[1]/div/div)[last()]",
+      "last_response": "(//*[starts-with(@id, 'message-')]/div[2]/div[2]/div/div[1]/div/div)[last()]",
       "typing_indicator": "//*[contains(@class, 'typing') or contains(text(), '正在输入')]"
     },
     "navigation": {
       "new_chat_button": "//button[contains(text(), 'New chat') or contains(text(), '新对话')]",
-      "model_selector": "//select[contains(@class, 'model-select')]",
+      "model_selector": "[data-testid='model-selector']",
       "sidebar_toggle": "//button[contains(@class, 'sidebar-toggle')]"
     }
   },

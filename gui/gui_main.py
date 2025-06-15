@@ -76,6 +76,8 @@ class MainWindow(QWidget):
         hl_buttons.addWidget(e['open_browser_btn'])
         hl_buttons.addWidget(e['start_btn'])
         layout.addLayout(hl_buttons)
+        # 无头模式选项
+        layout.addWidget(e['headless_checkbox'])
         self.setLayout(layout)
         # 事件绑定
         e['title_path_btn'].clicked.connect(self.choose_title_file)
@@ -99,6 +101,7 @@ class MainWindow(QWidget):
         e['prompt_edit'].setPlainText(c.get('prompt', ''))
         e['min_word_count_spin'].setValue(c.get('min_word_count', 800))
         e['continue_prompt_edit'].setPlainText(c.get('continue_prompt', ''))
+        e['headless_checkbox'].setChecked(c.get('headless', False))
 
     def update_model_detail(self):
         e = self.elements
@@ -155,12 +158,14 @@ class MainWindow(QWidget):
             'article_count': e['article_count_spin'].value(),
             'enable_image_collect': e['enable_image_collect'].isChecked(),
             'image_count': e['image_count_spin'].value(),
+            'headless': e['headless_checkbox'].isChecked(),
         }
         save_config(config)
         
         try:
             # 为本次工作流创建专用的浏览器实例
-            workflow_browser_manager = BrowserManager(port=9222)
+            is_headless = config.get('headless', False)
+            workflow_browser_manager = BrowserManager(port=9222, headless=is_headless)
             workflow_browser_manager.start_browser()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"为工作流启动浏览器时出错: {e}")

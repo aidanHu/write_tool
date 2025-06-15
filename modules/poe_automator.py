@@ -2,417 +2,304 @@ import os
 import time
 import json
 import logging
-import re
-from typing import Optional, Dict, Any
+from typing import Optional
+
 from .browser_manager import BrowserManager
 
 
 class PoeAutomator:
     """基于Chrome DevTools Protocol的POE自动化器"""
-    
-    def __init__(self, gui_config, browser_manager):
+
+    def __init__(self, gui_config: dict, browser_manager: BrowserManager, model_url: str):
         self.browser_manager = browser_manager
-        self.setup_logging()
+        self.logger = self._setup_logging()
+        self.model_url = model_url
+
+        # 加载并合并配置
+        base_config = self._load_config('poe_config.json')
+        base_config.update(gui_config)
+        self.config = base_config
+
+        # 提取常用配置项
+        self.selectors = self.config.get('selectors', {}).get('chat', {})
+        self.timeouts = self.config.get('timeouts', {})
+        self.urls = self.config.get('urls', {})
         
-        # 加载模块自身的配置文件，并与GUI传入的配置合并
-        local_config = self.load_config('poe_config.json')
-        local_config.update(gui_config)
-        self.config = local_config
-        
-        self.logger.info("POE自动化器初始化完成")
-    
-    def setup_logging(self):
-        """设置日志配置"""
-        self.logger = logging.getLogger('modules.poe_automator')
-        if not self.logger.handlers:
+        self.logger.info(f"POE自动化器初始化完成，目标URL: {self.model_url}")
+
+    def _setup_logging(self):
+        """设置日志记录器"""
+        logger = logging.getLogger('PoeAutomator')
+        if not logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
-    
-    def load_config(self, config_file):
-        """加载配置文件"""
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
+
+    def _load_config(self, config_file: str) -> dict:
+        """从JSON文件加载配置"""
         try:
             if os.path.exists(config_file):
                 with open(config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                self.logger.info(f"已加载配置文件: {config_file}")
-                return config
-            else:
-                # 创建默认配置
-                default_config = {
-                    "selectors": {
-                        "chat_input": "textarea[placeholder*='Talk']",
-                        "send_button": "button[data-testid='send-button']",
-                        "file_upload": "input[type='file']",
-                        "attach_button": "button[aria-label*='attach']",
-                        "message_container": "[class*='Message']",
-                        "bot_message": "[class*='bot'] [class*='markdown']",
-                        "login_button": "button[data-testid='loginButton']",
-                        "model_selector": "[data-testid='model-selector']"
-                    },
-                    "timeouts": {
-                        "page_load": 30,
-                        "element_wait": 15,
-                        "message_wait": 60,
-                        "upload_wait": 30
-                    },
-                    "retry": {
-                        "max_attempts": 3,
-                        "delay": 2
-                    },
-                    "content_generation": {
-                        "min_words": 800,
-                        "check_interval": 5,
-                        "max_wait_time": 300
-                    }
-                }
-                
-                with open(config_file, 'w', encoding='utf-8') as f:
-                    json.dump(default_config, f, ensure_ascii=False, indent=2)
-                
-                self.logger.info(f"已创建默认配置文件: {config_file}")
-                return default_config
-                
+                    return json.load(f)
+            self.logger.warning(f"配置文件 {config_file} 不存在，将使用默认或GUI传入的配置。")
         except Exception as e:
-            self.logger.error(f"加载配置文件失败: {str(e)}")
-            return {}
+            self.logger.error(f"加载配置文件 {config_file} 失败: {e}")
+        return {}
     
-    def navigate_to_poe(self, model_url=None):
-        """导航到POE页面"""
+    def _get_selector(self, name: str) -> Optional[str]:
+        """从配置中安全地获取选择器"""
+        selector = self.selectors.get(name)
+        if not selector:
+            self.logger.error(f"在配置中未找到选择器: '{name}'")
+        return selector
+
+    def navigate_to_poe(self) -> bool:
+        """导航到在初始化时指定的模型URL"""
         try:
-            url = model_url or "https://poe.com/"
-            self.browser_manager.navigate_to(url)
+            self.logger.info(f"导航到: {self.model_url}")
+            if not self.browser_manager.navigate_to(self.model_url):
+                raise ConnectionError("浏览器导航失败")
             
-            # 等待页面加载
+            self.browser_manager.close_other_tabs()
             time.sleep(3)
             
-            self.logger.info("成功导航到POE页面")
-            
-            # 清理多余标签页
-            all_tabs = self.browser_manager.get_all_tabs()
-            if len(all_tabs) > 1:
-                self.logger.info(f"发现 {len(all_tabs)} 个标签页，开始清理...")
-                current_tab_id = self.browser_manager.current_tab_id
-                for i in range(len(all_tabs) - 1, -1, -1):
-                    tab_id = all_tabs[i].get('id')
-                    if tab_id != current_tab_id:
-                        self.browser_manager.close_tab_by_id(tab_id)
-                self.logger.info("多余标签页清理完毕。")
+            chat_input_selector = self._get_selector('chat_input')
+            if not chat_input_selector or not self.browser_manager.wait_for_element(
+                chat_input_selector, self.timeouts.get('page_load', 30)
+            ):
+                self.logger.error("导航后未能找到聊天输入框，页面可能未正确加载。")
+                return False
 
+            self.logger.info("成功导航到POE页面并找到聊天输入框。")
             return True
-            
         except Exception as e:
-            self.logger.error(f"导航到POE失败: {str(e)}")
+            self.logger.error(f"导航到POE失败: {e}")
             return False
-    
-    def wait_for_chat_ready(self):
-        """等待聊天界面准备就绪"""
-        try:
-            print("🔍 [DEBUG] 等待POE聊天界面准备就绪...")
-            
-            chat_input_selector = self.config.get('selectors', {}).get('chat_input', 'textarea[placeholder*="Talk"]')
-            timeout = self.config.get('timeouts', {}).get('element_wait', 15)
-            
-            print(f"🔍 [DEBUG] 聊天输入框选择器: {chat_input_selector}")
-            print(f"🔍 [DEBUG] 等待超时时间: {timeout}秒")
-            
-            # 先检查页面上的textarea元素
-            try:
-                textarea_count = self.browser_manager.execute_script("document.querySelectorAll('textarea').length")
-                print(f"🔍 [DEBUG] 页面上textarea元素数量: {textarea_count}")
-                
-                if textarea_count > 0:
-                    textarea_info = self.browser_manager.execute_script("""
-                        Array.from(document.querySelectorAll('textarea')).slice(0, 3).map(el => ({
-                            placeholder: el.placeholder,
-                            className: el.className,
-                            id: el.id,
-                            visible: el.offsetParent !== null
-                        }))
-                    """)
-                    print(f"🔍 [DEBUG] 前3个textarea信息: {textarea_info}")
-            except Exception as e:
-                print(f"❌ [DEBUG] 获取textarea信息失败: {e}")
-            
-            print(f"🔍 [DEBUG] 开始等待聊天输入框...")
-            if self.browser_manager.wait_for_element(chat_input_selector, timeout):
-                print("✅ [DEBUG] 聊天界面已准备就绪")
-                self.logger.info("聊天界面已准备就绪")
-                return True
-            else:
-                print("❌ [DEBUG] 聊天界面未准备就绪")
-                self.logger.error("聊天界面未准备就绪")
-                return False
-                
-        except Exception as e:
-            print(f"❌ [DEBUG] 等待聊天界面异常: {e}")
-            self.logger.error(f"等待聊天界面失败: {str(e)}")
+
+    def upload_file(self, file_path: str) -> bool:
+        """
+        直接为隐藏的input元素设置文件路径，绕过点击按钮。
+        """
+        self.logger.info(f"开始直接上传文件: {file_path}")
+        if not os.path.exists(file_path):
+            self.logger.error(f"素材文件不存在: {file_path}")
             return False
-    
-    def upload_file(self, file_path):
-        """上传文件 - 根据需求文档优化"""
+
         try:
-            if not os.path.exists(file_path):
-                self.logger.error(f"素材文件不存在: {file_path}")
-                return False
-            
-            # 1. 定位上传按钮
-            upload_button_xpath = "//button[@data-button-file-input='true']"
-            upload_button = self.browser_manager.find_element(upload_button_xpath, timeout=10)
-            
-            if not upload_button:
-                self.logger.error("未找到文件上传按钮。")
+            file_input_selector = self._get_selector('file_input')
+            if not file_input_selector:
                 return False
 
-            # 2. 使用 set_input_files 上传文件
-            # 这是更可靠的上传方式，它模拟了文件选择对话框
-            success = self.browser_manager.set_input_files(
-                "//input[@type='file']", # 通常隐藏的文件输入元素
-                file_path
-            )
-
-            if success:
-                self.logger.info(f"文件已提交上传: {file_path}")
-                # 等待文件上传完成的视觉提示（例如，文件名出现在输入框附近）
-                time.sleep(self.config.get('timeouts', {}).get('upload_wait', 30))
-                return True
-            else:
-                self.logger.error("文件上传失败。")
+            # 直接调用set_input_files，不再点击上传按钮
+            self.logger.info(f"正在直接为选择器 '{file_input_selector}' 设置文件...")
+            if not self.browser_manager.set_input_files(file_input_selector, file_path):
+                self.logger.error(f"使用set_input_files方法上传文件 '{file_path}' 失败。")
                 return False
-                
+
+            self.logger.info(f"文件上传操作已提交: {file_path}")
+            # 使用一个合理的短等待时间，而不是从配置中读取可能很长的值
+            time.sleep(3)
+            return True
         except Exception as e:
-            self.logger.error(f"上传文件时出现异常: {str(e)}")
+            self.logger.error(f"上传文件时出现异常: {e}", exc_info=True)
             return False
-    
-    def send_message(self, message):
-        """发送消息"""
+
+    def send_prompt(self, prompt: str) -> bool:
+        """在文本框中输入提示并点击发送。"""
+        self.logger.info("开始发送提示...")
         try:
-            chat_input_selector = self.config.get('selectors', {}).get('chat_input', 'textarea[placeholder*="Talk"]')
-            send_button_selector = self.config.get('selectors', {}).get('send_button', 'button[data-testid="send-button"]')
+            chat_input_selector = self._get_selector('chat_input')
+            send_button_selector = self._get_selector('send_button')
+            if not chat_input_selector or not send_button_selector:
+                return False
+
+            self.logger.info("正在输入提示文本...")
+            element = self.browser_manager.find_element(chat_input_selector)
+            if not element:
+                 self.logger.error(f"找不到聊天输入框: {chat_input_selector}")
+                 return False
             
-            # 清空输入框并输入消息
-            clear_script = f"""
-            var input = document.querySelector('{chat_input_selector}');
-            if (input) {{
-                input.focus();
-                input.value = '';
-                input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                true;
-            }} else {{
-                false;
+            # 使用 type_text 进行输入，这里假设 browser_manager 有一个可以处理 xpath 的输入方法
+            # 如果没有，我们需要依赖JS注入
+            # 为了修复之前的语法错误，我们暂时使用一个更简单但可能较慢的方法
+            # self.browser_manager.type_text(element, prompt) 
+            # 鉴于 browser_manager 的 type_text 可能不兼容 xpath, 我们还是用JS，但保证语法正确
+
+            escaped_prompt = json.dumps(prompt)
+            # f-string的表达式部分不能包含反斜杠，所以我们先把替换操作拿出来
+            escaped_selector = chat_input_selector.replace('"', '\\"')
+            js_code = f"""
+            var ta = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (ta) {{
+                ta.value = {escaped_prompt};
+                ta.dispatchEvent(new Event('input', {{'bubbles': true}}));
+                ta.focus();
             }}
             """
+            self.browser_manager.execute_script(js_code)
             
-            if not self.browser_manager.execute_script(clear_script):
-                self.logger.error("无法清空输入框")
-                return False
-            
-            # 输入消息
-            if not self.browser_manager.type_text(chat_input_selector, message):
-                self.logger.error("无法输入消息")
-                return False
-            
-            time.sleep(1)
-            
-            # 点击发送按钮或按回车
-            if self.browser_manager.is_element_visible(send_button_selector):
-                if not self.browser_manager.click_element(send_button_selector):
-                    self.logger.warning("点击发送按钮失败，尝试按回车键发送。")
-                    self.browser_manager.press_key(chat_input_selector, 'Enter')
-            else:
-                self.logger.info("未找到发送按钮，直接按回车键发送。")
-                self.browser_manager.press_key(chat_input_selector, 'Enter')
+            # 删除不必要的等待，实现即时发送
+            # time.sleep(1)
 
-            self.logger.info("消息已发送")
+            self.logger.info(f"正在点击发送按钮: {send_button_selector}")
+            if not self.browser_manager.click_element_by_xpath(send_button_selector):
+                self.logger.error("点击发送按钮失败。")
+                return False
+
+            self.logger.info("提示已成功发送。")
             return True
-                
         except Exception as e:
-            self.logger.error(f"发送消息失败: {str(e)}")
+            self.logger.error(f"发送提示时出现异常: {e}", exc_info=True)
             return False
-    
-    def wait_for_response(self, timeout=None):
-        """
-        等待AI响应完成。
-        通过循环检测"停止"按钮的可见性来判断AI是否仍在生成。
-        """
-        timeout = timeout or self.config.get('timeouts', {}).get('message_wait', 60)
-        check_interval = self.config.get('content_generation', {}).get('check_interval', 5)
-        stop_button_xpath = "//button[.//span[text()='停止']]"
-        
-        start_time = time.time()
-        
-        self.logger.info("等待AI响应...")
-        
-        # 初始等待，让AI有时间开始生成
-        time.sleep(check_interval)
-        
-        while time.time() - start_time < timeout:
-            is_generating = self.browser_manager.is_element_visible(stop_button_xpath)
-            if is_generating:
-                self.logger.info("AI仍在生成内容，继续等待...")
+
+    def wait_for_generation_to_complete(self) -> bool:
+        """等待内容生成完成。"""
+        self.logger.info("等待内容生成完成...")
+        try:
+            stop_button_selector = self._get_selector('stop_button')
+            if not stop_button_selector:
+                return False
+            
+            timeout = self.timeouts.get('ai_response_wait', 300)
+            check_interval = self.timeouts.get('typing_check_interval', 3)
+
+            self.logger.info("等待'停止'按钮出现...")
+            start_time = time.time()
+            stop_button_found = False
+            while time.time() - start_time < timeout:
+                if self.browser_manager.is_element_present(stop_button_selector):
+                    self.logger.info("'停止'按钮已出现，内容正在生成中。")
+                    stop_button_found = True
+                    break
                 time.sleep(check_interval)
-            else:
-                self.logger.info("AI响应完成（'停止'按钮不可见）。")
-                # 为确保内容完全渲染，再稍作等待
-                time.sleep(2)
+            
+            if not stop_button_found:
+                self.logger.warning("在超时时间内未检测到'停止'按钮，可能已秒速生成或未开始生成。继续后续步骤。")
                 return True
+
+            self.logger.info("等待'停止'按钮消失...")
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if not self.browser_manager.is_element_present(stop_button_selector):
+                    self.logger.info("'停止'按钮已消失，内容生成完成。")
+                    time.sleep(2)
+                    return True
+                time.sleep(check_interval)
+
+            self.logger.error("超时！'停止'按钮长时间未消失，生成可能已卡住。")
+            return False
+        except Exception as e:
+            self.logger.error(f"等待生成完成时出现异常: {e}", exc_info=True)
+            return False
+
+    def get_latest_response(self) -> Optional[str]:
+        """
+        获取最后一条由机器人生成的消息的HTML内容。
+        """
+        self.logger.info("正在获取最新生成的内容 (HTML)...")
+        try:
+            response_selector = self._get_selector('last_response')
+            if not response_selector:
+                return None
+
+            # 修正f-string错误：将替换操作移到f-string外部
+            escaped_selector = response_selector.replace('"', '\\"')
+            js_script = f"""
+            (function() {{
+                var element = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                return element ? element.innerHTML : null;
+            }})()
+            """
+            
+            for _ in range(3):
+                html_content = self.browser_manager.execute_script(js_script)
+                if html_content and html_content.strip():
+                    self.logger.info(f"成功获取到HTML内容，长度为 {len(html_content)}。")
+                    return html_content
+                time.sleep(1)
+
+            self.logger.error(f"未能获取到最新回复的HTML内容，选择器: {response_selector}")
+            return None
+        except Exception as e:
+            self.logger.error(f"获取最新回复时出现异常: {e}", exc_info=True)
+            return None
+
+    def generate_content(self, prompt: str, article_file: Optional[str] = None) -> Optional[str]:
+        """
+        执行完整的Poe文章生成工作流。
+        现在接收prompt作为参数，并且article_file是可选的。
+        """
+        self.logger.info(f"--- 开始Poe内容生成工作流 ---")
+        self.logger.info(f"提示: {prompt}")
+
+        if not self.navigate_to_poe():
+            return None
+
+        # 如果提供了文章路径，则执行上传
+        if article_file and os.path.exists(article_file):
+            self.logger.info(f"素材文件: {article_file}")
+            if not self.upload_file(article_file):
+                # 上传失败是一个严重问题，应该中止
+                self.logger.error("文章上传失败，中止本次任务。")
+                return None
+        else:
+            self.logger.info("未提供文章附件或文件不存在，将直接根据提示进行创作。")
+            
+        if not self.send_prompt(prompt):
+            return None
+
+        if not self.wait_for_generation_to_complete():
+            return None
+
+        content = self.get_latest_response()
         
-        self.logger.warning(f"等待AI响应超时（{timeout}秒）。")
-        return False
-    
-    def get_latest_response(self):
-        """获取最新的AI回复"""
-        try:
-            # 使用需求文档中指定的XPath
-            response_xpath = "(//*[starts-with(@id, 'message-')]/div[2]/div[2]/div/div[1]/div/div)[last()]"
+        if content:
+            self.logger.info("--- Poe内容生成工作流成功结束 ---")
+        else:
+            self.logger.error("--- Poe内容生成工作流结束，但未能获取到内容 ---")
             
-            # 获取HTML内容
-            html_content = self.browser_manager.get_element_html(response_xpath)
+        return content
 
-            if html_content:
-                self.logger.info("成功获取最新的AI回复内容。")
-                return html_content
-            else:
-                self.logger.warning("未能获取AI回复内容，可能元素未找到。")
-                return None
-        except Exception as e:
-            self.logger.error(f"获取最新回复失败: {str(e)}")
+    def continue_generation(self, prompt: str) -> Optional[str]:
+        """
+        用于在已有对话中继续生成内容（二次创作）。
+        """
+        self.logger.info("--- 开始二次创作 ---")
+        self.logger.info(f"二次创作提示: {prompt}")
+
+        if not self.send_prompt(prompt):
             return None
-    
-    def check_content_length(self, content, min_words):
-        """检查内容字数"""
-        # 简单的字数计算，基于空格和换行
-        word_count = len(content.split())
-        self.logger.info(f"当前内容字数: {word_count}，最小要求: {min_words}")
-        return word_count >= min_words
-    
-    def generate_content(self, title):
-        """
-        生成内容的完整流程。
-        - 导航到指定模型URL
-        - 上传文件（如果存在）
-        - 发送提示词
-        - 等待响应
-        - 检查内容长度并补充
-        - 返回最终的HTML内容
-        """
-        try:
-            prompt = self.config.get('prompt', '')
-            model_url = self.config.get('model_url', 'https://poe.com')
-            min_words = self.config.get('min_word_count', 800)
-            supplemental_prompt = self.config.get('continue_prompt', '继续')
-            
-            # 组合主提示词
-            main_prompt = f"{prompt}\n\n标题：{title}"
-            
-            # 检查是否存在素材文件
-            article_file = "article.txt" if os.path.exists("article.txt") else None
 
-            # 1. 导航到指定的模型页面
-            if not self.navigate_to_poe(model_url):
-                return None
-            
-            # 2. 等待聊天界面加载完成
-            if not self.wait_for_chat_ready():
-                self.logger.error("聊天界面未就绪，无法继续。")
-                return None
-            
-            # 3. 如果有素材文件，则上传
-            if article_file:
-                if not self.upload_file(article_file):
-                    self.logger.warning("素材文件上传失败，将仅使用提示词继续。")
-            
-            # 4. 发送主提示词
-            if not self.send_message(main_prompt):
-                self.logger.error("发送主提示词失败。")
-                return None
-            
-            # 5. 等待AI响应
-            self.wait_for_response()
-            
-            # 6. 获取响应并检查长度
-            response_content = self.get_latest_response()
-            if not response_content:
-                self.logger.error("未能获取AI响应内容。")
-                return None
-
-            # 7. 循环补充内容直到满足最低字数要求
-            while not self.check_content_length(response_content, min_words):
-                self.logger.info(f"当前字数不足{min_words}，发送补充提示词...")
-                if not self.send_message(supplemental_prompt):
-                    self.logger.error("发送补充提示词失败，中止内容生成。")
-                    break
-                
-                self.wait_for_response()
-                new_content = self.get_latest_response()
-                if new_content == response_content: # 如果内容没有变化
-                    self.logger.warning("补充内容后响应没有变化，可能已达上限。")
-                    break
-                response_content = new_content
-            
-            self.logger.info("内容生成完成。")
-            return response_content
-            
-        except Exception as e:
-            self.logger.error(f"内容生成过程中发生严重错误: {e}", exc_info=True)
+        if not self.wait_for_generation_to_complete():
             return None
-    
-    def _clean_html_to_markdown(self, html_content):
-        """
-        一个简单的、零依赖的HTML到Markdown转换器。
-        - 移除脚本和样式
-        - 转换标题、段落、列表等
-        - 剥离其余HTML标签
-        """
-        if not html_content:
-            return ""
+        
+        content = self.get_latest_response()
+        if content:
+            self.logger.info("--- 二次创作成功结束 ---")
+        else:
+            self.logger.error("--- 二次创作结束，但未能获取到内容 ---")
+        
+        return content
 
-        # 1. 移除脚本和样式块
-        content = re.sub(r'<(script|style).*?>.*?</\1>', '', html_content, flags=re.DOTALL)
-
-        # 2. 基本的块级元素转换 (在剥离标签前)
-        content = re.sub(r'</p>', r'</p>\n', content)
-        content = re.sub(r'<br\s*/?>', r'\n', content)
-        content = re.sub(r'<h1>(.*?)</h1>', r'# \1\n', content)
-        content = re.sub(r'<h2>(.*?)</h2>', r'## \1\n', content)
-        content = re.sub(r'<h3>(.*?)</h3>', r'### \1\n', content)
-        content = re.sub(r'<li>(.*?)</li>', r'- \1\n', content)
-
-        # 3. 剥离所有剩下的HTML标签
-        text_content = re.sub(r'<[^>]+>', '', content)
-
-        # 4. 清理多余的空行
-        text_content = re.sub(r'\n\s*\n', '\n\n', text_content).strip()
-
-        return text_content
-
-    def save_content(self, html_content, output_file):
-        """将HTML内容转换为Markdown并保存"""
-        if not html_content:
+    def save_content(self, markdown_content: str, output_file: str) -> bool:
+        """将最终的Markdown内容保存到指定文件。"""
+        if not markdown_content:
             self.logger.error("没有内容可保存。")
             return False
-            
         try:
-            # 使用内部方法转换
-            markdown_content = self._clean_html_to_markdown(html_content)
-
-            # 创建目录（如果不存在）
             output_dir = os.path.dirname(output_file)
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-                
+            os.makedirs(output_dir, exist_ok=True)
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
-            
-            self.logger.info(f"内容已成功保存为Markdown文件: {output_file}")
+            self.logger.info(f"内容已成功保存到: {output_file}")
             return True
         except Exception as e:
-            self.logger.error(f"保存内容为Markdown时出错: {str(e)}")
+            self.logger.error(f"保存Markdown内容时出错: {e}", exc_info=True)
             return False
-    
+
     def cleanup(self):
-        """清理资源，关闭浏览器"""
-        self.browser_manager.close()
-        self.logger.info("浏览器已关闭，清理完成。") 
+        """清理资源（如果需要）"""
+        self.logger.info("PoeAutomator清理完成。") 

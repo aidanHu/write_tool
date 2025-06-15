@@ -4,6 +4,7 @@ import time
 import requests
 import random
 import string
+import uuid
 from PIL import Image
 from qiniu import Auth, put_file, BucketManager
 import logging
@@ -108,17 +109,15 @@ class ImageHandler:
 
     def generate_random_filename(self, extension="jpg"):
         """
-        生成随机文件名
+        生成一个基于UUID的、保证唯一的随机文件名。
         
         Args:
             extension: 文件扩展名
             
         Returns:
-            str: 随机文件名
+            str: 唯一的随机文件名
         """
-        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-        timestamp = str(int(time.time()))
-        return f"{timestamp}_{random_str}.{extension}"
+        return f"{uuid.uuid4().hex}.{extension}"
 
     def upload_to_qiniu(self, local_path, key=None):
         """
