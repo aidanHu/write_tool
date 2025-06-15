@@ -36,33 +36,52 @@ class ImageHandler:
             self.auth = None
             self.logger.warning("未配置七牛云认证信息")
 
-    def download_image(self, url, save_path):
+    def download_image(self, url, save_path, referer=None, browser_manager=None):
         """
-        下载图片到本地
+        下载图片到本地。
+        优先使用浏览器下载，以绕过复杂的防盗链。
         
         Args:
             url: 图片URL
             save_path: 保存路径
+            referer: (此参数保留，但浏览器下载模式下通常不需要)
+            browser_manager: 浏览器管理器实例
             
         Returns:
             bool: 下载是否成功
         """
+        if browser_manager:
+            try:
+                self.logger.info(f"使用浏览器模式下载图片: {url}")
+                success = browser_manager.download_image_in_browser(url, save_path)
+                if success:
+                    self.logger.info(f"浏览器下载成功: {save_path}")
+                    return True
+                else:
+                    self.logger.warning(f"浏览器下载失败，尝试使用备用方案: {url}")
+            except Exception as e:
+                self.logger.error(f"浏览器下载模式出现异常: {e}", exc_info=True)
+                # 出现异常也尝试后备方案
+
+        # 后备方案：使用requests库下载 (如果浏览器模式失败或未提供管理器)
+        self.logger.info(f"使用Requests (后备方案) 下载图片: {url}")
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
+            if referer:
+                headers['Referer'] = referer
             
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
             response.raise_for_status()
             
             with open(save_path, 'wb') as f:
                 f.write(response.content)
-                
-            self.logger.info(f"图片下载成功: {save_path}")
+            self.logger.info(f"Requests下载成功: {save_path}")
             return True
             
         except Exception as e:
-            self.logger.error(f"图片下载失败 {url}: {str(e)}")
+            self.logger.error(f"Requests (后备方案) 下载失败 {url}: {str(e)}")
             return False
 
     def crop_and_resize_image(self, image_path, output_path, max_width=800, max_height=600, crop_bottom_pixels=0):
@@ -166,13 +185,15 @@ class ImageHandler:
             self.logger.error(f"图片上传异常: {str(e)}")
             return None
 
-    def download_and_crop(self, url, crop_bottom_pixels=0):
+    def download_and_crop(self, url, crop_bottom_pixels=0, referer=None, browser_manager=None):
         """
         下载图片并裁剪，返回本地路径
         
         Args:
             url: 图片URL
             crop_bottom_pixels: 从底部裁剪的像素值
+            referer: 下载时使用的Referer头
+            browser_manager: 浏览器管理器实例
             
         Returns:
             str: 处理后的本地图片路径，失败返回None
@@ -189,8 +210,8 @@ class ImageHandler:
             original_path = os.path.join(temp_dir, original_filename)
             processed_path = os.path.join(temp_dir, processed_filename)
             
-            # 下载图片
-            if self.download_image(url, original_path):
+            # 下载图片，传入referer和browser_manager
+            if self.download_image(url, original_path, referer=referer, browser_manager=browser_manager):
                 # 处理图片
                 if self.crop_and_resize_image(original_path, processed_path, crop_bottom_pixels=crop_bottom_pixels):
                     # 删除原始文件
@@ -204,13 +225,15 @@ class ImageHandler:
             self.logger.error(f"图片下载和处理失败: {str(e)}")
             return None
 
-    def process_and_upload_image(self, url, crop_bottom_pixels=0):
+    def process_and_upload_image(self, url, crop_bottom_pixels=0, referer=None, browser_manager=None):
         """
         完整的图片处理流程：下载 -> 处理 -> 上传 -> 清理
         
         Args:
             url: 原始图片URL
             crop_bottom_pixels: 从底部裁剪的像素值
+            referer: 下载时使用的Referer头
+            browser_manager: 浏览器管理器实例
             
         Returns:
             str: 七牛云图片URL，失败返回None
@@ -218,7 +241,7 @@ class ImageHandler:
         local_path = None
         try:
             # 下载并处理图片
-            local_path = self.download_and_crop(url, crop_bottom_pixels=crop_bottom_pixels)
+            local_path = self.download_and_crop(url, crop_bottom_pixels=crop_bottom_pixels, referer=referer, browser_manager=browser_manager)
             if not local_path:
                 return None
                 
@@ -249,32 +272,18 @@ class ImageHandler:
         Returns:
             list: 处理后的七牛云图片URL列表
         """
-        processed_urls = []
-        
+        qiniu_urls = []
         for url in image_urls:
-            try:
-                processed_url = self.process_and_upload_image(url, crop_bottom_pixels=crop_bottom_pixels)
-                if processed_url:
-                    processed_urls.append(processed_url)
-                    self.logger.info(f"图片处理成功: {url} -> {processed_url}")
-                else:
-                    self.logger.warning(f"图片处理失败: {url}")
-                    
-            except Exception as e:
-                self.logger.error(f"处理图片时出错 {url}: {str(e)}")
-                continue
+            # 注意：批量处理时无法提供特定的referer或浏览器实例，可能影响下载成功率
+            qiniu_url = self.process_and_upload_image(url, crop_bottom_pixels)
+            if qiniu_url:
+                qiniu_urls.append(qiniu_url)
                 
-        return processed_urls
+        return qiniu_urls
 
     def set_qiniu_config(self, access_key, secret_key, bucket_name, domain=None):
         """
-        设置七牛云配置
-        
-        Args:
-            access_key: 七牛云Access Key
-            secret_key: 七牛云Secret Key
-            bucket_name: 存储空间名称
-            domain: 自定义域名
+        动态设置七牛云配置
         """
         self.access_key = access_key
         self.secret_key = secret_key

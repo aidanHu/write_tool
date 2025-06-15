@@ -9,3 +9,4 @@ webdriver-manager
 requests
 psutil
 markdownify 
+beautifulsoup4 
