@@ -28,6 +28,7 @@ def get_elements(platforms=None, model_map=None):
         'min_word_count_spin': QSpinBox(),
         'continue_prompt_label': QLabel('继续创作提示词'),
         'continue_prompt_edit': QTextEdit(),
+        'open_browser_btn': QPushButton('打开浏览器'),
         'start_btn': QPushButton('开始运行'),
     }
     # 选项初始化

@@ -3,4 +3,8 @@ playwright
 pandas
 openpyxl
 Pillow
-qiniu 
+qiniu
+selenium
+webdriver-manager
+requests
+psutil 

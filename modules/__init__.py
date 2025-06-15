@@ -1,4 +1,21 @@
-# model_operator支持模型平台、详细模型和模型网址参数
-# 所有模块均可根据详细模型适配具体逻辑
-# modules支持详细模型适配
-# modules支持模型配置文件动态加载 
+# modules/__init__.py
+"""
+写作工具模块包
+基于Chrome DevTools Protocol的自动化写作工具
+"""
+
+from .browser_manager import BrowserManager
+from .poe_automator import PoeAutomator
+from .toutiao_scraper import ToutiaoScraper
+from .title_reader import TitleReader
+from .image_handler import ImageHandler
+from .qiniu_config import QiniuConfig
+
+__all__ = [
+    'BrowserManager',
+    'PoeAutomator', 
+    'ToutiaoScraper',
+    'TitleReader',
+    'ImageHandler',
+    'QiniuConfig'
+] 

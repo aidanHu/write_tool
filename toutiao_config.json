@@ -1,0 +1,81 @@
+{
+  "urls": {
+    "homepage": "https://www.toutiao.com/",
+    "search_base": "https://so.toutiao.com/"
+  },
+  "selectors": {
+    "homepage": {
+      "search_input": "//*[@id=\"root\"]/div/div[4]/div/div[1]/input",
+      "search_button": "//*[@id=\"root\"]/div/div[4]/div/div[1]/button"
+    },
+    "search_results": {
+      "news_tab": "//*[starts-with(@id, 's-dom-')]/div/div/div[3]/div[1]/a[2]",
+      "article_links": [
+        "/html/body/div[2]/div[2]/div/div/div/div/div/div[1]/div/a",
+        "//div[contains(@class, \"result\")]//a[contains(@href, \"toutiao.com\")]",
+        "//a[contains(@href, \"/article/\")]",
+        "//div[@class=\"result-content\"]//a"
+      ],
+      "next_page_buttons": [
+        "//a[contains(@class, 'cs-button') and .//span[text()='2']]"
+      ]
+    },
+    "article_page": {
+      "content_containers": [
+        "//*[@id=\"root\"]/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article",
+        "//article",
+        "//div[contains(@class, \"article-content\")]",
+        "//div[contains(@class, \"content\")]"
+      ],
+      "title_selectors": [
+        "h1",
+        "h2", 
+        ".title",
+        "[class*=\"title\"]"
+      ],
+      "image_selectors": [
+        "//*[@id=\"root\"]/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article/div/img",
+        "//article//img",
+        "//div[contains(@class, \"content\")]//img",
+        "//img[contains(@src, \"http\")]"
+      ]
+    }
+  },
+  "timeouts": {
+    "page_load": 30,
+    "element_wait": 15,
+    "implicit_wait": 10,
+    "search_delay": 5,
+    "article_delay": 2
+  },
+  "browser_options": {
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "window_size": "1920,1080",
+    "chrome_args": [
+      "--no-sandbox",
+      "--disable-dev-shm-usage", 
+      "--disable-blink-features=AutomationControlled",
+      "--disable-web-security",
+      "--allow-running-insecure-content",
+      "--disable-extensions",
+      "--disable-gpu"
+    ],
+    "chrome_experimental_options": {
+      "excludeSwitches": ["enable-automation"],
+      "useAutomationExtension": false
+    }
+  },
+  "retry_config": {
+    "max_retries": 3,
+    "retry_delay": 2,
+    "page_load_retries": 3,
+    "search_retries": 3,
+    "content_extract_retries": 2
+  },
+  "random_delays": {
+    "min_delay": 2,
+    "max_delay": 5,
+    "between_articles": true,
+    "between_pages": true
+  }
+} 
