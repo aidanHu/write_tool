@@ -1,26 +1,27 @@
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+/gui/__pycache__/
+/modules/__pycache__/
+
+# Logs
 *.log
-write_tool_chrome_profile/
-article.txt
+
+# User-specific configuration (sensitive or local)
 config.json
-/gui/__pycache__
-/gui/__pycache__
-/gui/__pycache__
-*.pyc
-/gui/__pycache__
-gui/__pycache__/gui_main.cpython-310.pyc
-/write_tool_chrome_profile_497d0b20
-/gui/__pycache__
-gui/__pycache__/gui_main.cpython-310.pyc
-gui/__pycache__/elements.cpython-310.pyc
-/gui/__pycache__
-/gui/__pycache__
-/gui/__pycache__
-/gui/__pycache__
-gui/__pycache__/elements.cpython-310.pyc
-gui/__pycache__/gui_main.cpython-310.pyc
-/gui/__pycache__
-/gui/__pycache__
+qiniu_config.json
+
+# Output files
+article.txt
+picture.txt
+/output/
+
+# Browser profile
+write_tool_chrome_profile/
+picture.txt
+*.txt

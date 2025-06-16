@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import re
 from typing import Optional
 
 from .browser_manager import BrowserManager
@@ -197,31 +198,45 @@ class PoeAutomator:
 
     def get_latest_response(self) -> Optional[str]:
         """
-        获取最后一条由机器人生成的消息的HTML内容。
+        获取最后一条机器人消息的HTML，并智能移除末尾的时间戳节点。
         """
-        self.logger.info("正在获取最新生成的内容 (HTML)...")
+        self.logger.info("正在获取最新生成的内容 (HTML)，并尝试移除末尾的时间戳...")
         try:
             response_selector = self._get_selector('last_response')
             if not response_selector:
                 return None
 
-            # 修正f-string错误：将替换操作移到f-string外部
             escaped_selector = response_selector.replace('"', '\\"')
+            
+            # JS脚本在浏览器端直接操作DOM，寻找并移除只包含时间戳的最后一个子元素
             js_script = f"""
             (function() {{
-                var element = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                return element ? element.innerHTML : null;
+                var container = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (!container) {{ return null; }}
+
+                var lastElement = container.lastElementChild;
+                if (lastElement) {{
+                    // 正则表达式，用于匹配 "10:31" 或 "01:23:45" 这样的时间戳
+                    var timestampRegex = /^\\s*\\d{{1,2}}:\\d{{2}}(:\\d{{2}})?\\s*$/;
+                    if (timestampRegex.test(lastElement.innerText)) {{
+                        // 如果最后一个元素的文本内容是时间戳，则直接移除该元素
+                        lastElement.remove();
+                    }}
+                }}
+                
+                // 返回清理后的HTML内容
+                return container.innerHTML;
             }})()
             """
             
             for _ in range(3):
                 html_content = self.browser_manager.execute_script(js_script)
                 if html_content and html_content.strip():
-                    self.logger.info(f"成功获取到HTML内容，长度为 {len(html_content)}。")
+                    self.logger.info(f"成功获取并清理了HTML内容，长度为 {len(html_content)}。")
                     return html_content
                 time.sleep(1)
 
-            self.logger.error(f"未能获取到最新回复的HTML内容，选择器: {response_selector}")
+            self.logger.warning(f"未能获取到最新回复的HTML内容，或内容为空。选择器: {response_selector}")
             return None
         except Exception as e:
             self.logger.error(f"获取最新回复时出现异常: {e}", exc_info=True)

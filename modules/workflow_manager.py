@@ -40,12 +40,17 @@ class WorkflowThread(QThread):
         """
         根据GUI的配置，运行完整的工作流。
         """
+        completed_count = 0
+        total_tasks = 0
         try:
             # 1. 初始化
             title_reader = TitleReader(self.config['title_file_path'])
+            if not title_reader.is_valid:
+                print("TitleReader初始化失败，请检查Excel文件路径或文件内容。工作流终止。")
+                return
+
             titles_to_process = title_reader.get_all_pending_titles()
             total_tasks = len(titles_to_process)
-            completed_count = 0
             
             if not titles_to_process:
                 print("所有标题都已处理完毕，无需执行新任务。")

@@ -118,8 +118,10 @@ class ToutiaoScraper:
         )
         
         qiniu_links = []
-        # 从主配置中读取裁剪像素值
-        crop_pixels = self.config.get('crop_bottom_pixels', 0)
+        
+        # 从配置中读取裁剪像素值，如果未配置，则默认为80
+        crop_pixels = self.config.get('scraping', {}).get('crop_bottom_pixels', 80)
+        self.logger.info(f"图片处理：将从每张图片底部裁剪 {crop_pixels} 像素。")
         
         for i, image_data in enumerate(images_to_process):
             try:
@@ -127,12 +129,11 @@ class ToutiaoScraper:
                 referer = image_data['referer']
                 self.logger.info(f"--- [图片 {i+1}/{len(images_to_process)}] 开始处理: {url} ---")
                 
-                # 使用ImageHandler的集成方法处理图片，并传入referer和browser_manager
+                # 使用ImageHandler的集成方法处理图片，并传入referer
                 qiniu_link = image_handler.process_and_upload_image(
                     url, 
                     crop_bottom_pixels=crop_pixels, 
-                    referer=referer, 
-                    browser_manager=self.browser_manager
+                    referer=referer
                 )
                 
                 if qiniu_link:
@@ -195,10 +196,7 @@ class ToutiaoScraper:
                                 "[class*=\"title\"]"
                             ],
                             "image_selectors": [
-                                "//*[@id=\"root\"]/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article/div/img",
-                                "//article//img",
-                                "//div[contains(@class, \"content\")]//img",
-                                "//img[contains(@src, \"http\")]"
+                                "//*[@id=\"root\"]/div[2]/div[2]/div[1]/div/div/div/div/div[2]/article/div/img"
                             ]
                         }
                     },
@@ -214,7 +212,8 @@ class ToutiaoScraper:
                         "max_pages": 3,
                         "max_images": 5,
                         "delay_between_requests": 2,
-                        "content_min_length": 100
+                        "content_min_length": 100,
+                        "crop_bottom_pixels": 80
                     },
                     "random_delays": {
                         "min_delay": 1,
@@ -570,141 +569,48 @@ class ToutiaoScraper:
         return None
     
     def _extract_article_images_with_referer(self):
-        """
-        在当前文章页面中提取所有图片链接，并附带当前页面的URL作为Referer。
-        """
-        self.logger.info("开始提取文章图片及Referer...")
-        image_data_list = []
+        """提取文章中的所有图片链接，并附带当前文章的URL作为Referer。"""
         current_url = self.browser_manager.get_current_url()
+        if not current_url:
+            self.logger.warning("无法获取当前文章URL，图片下载可能会失败。")
 
-        # 1. 滚动页面以触发懒加载
         self.logger.info("滚动页面以加载所有图片...")
-        self.browser_manager.scroll_to_bottom(steps=15, delay=0.3)
-        time.sleep(3)  # 等待图片资源加载
+        self.browser_manager.scroll_to_bottom()
+        time.sleep(3) # 等待懒加载图片出现
 
-        # 2. 从配置文件获取图片选择器列表
-        selectors = self.config.get('selectors', {}).get('article_page', {}).get('image_selectors', [])
-        if not selectors:
-            self.logger.error("配置文件中未定义 'image_selectors'。")
-            return []
+        selectors_to_try = self.config['selectors']['article_page']['image_selectors']
+        self.logger.info(f"将要严格按照您配置的选择器列表依次尝试: {selectors_to_try}")
 
-        self.logger.info(f"将要尝试的选择器: {selectors}")
-        
-        image_urls = set()
-
-        # 3. 遍历所有选择器寻找图片元素
-        for selector in selectors:
-            try:
-                # 使用JS脚本一次性提取所有符合条件的图片URL，效率更高
-                escaped_selector = selector.replace('"', '\\"')
-                js_script = f"""
-                (function() {{
-                    const urls = new Set();
-                    const query = document.evaluate("{escaped_selector}", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                    
-                    for (let i = 0; i < query.snapshotLength; i++) {{
-                        let img = query.snapshotItem(i);
-                        // 智能检查多个属性，优先使用data-src等懒加载属性
-                        let bestUrl = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('src');
-                        
-                        if (bestUrl && bestUrl.startsWith('http')) {{
-                            // 关键修正：不再移除URL中的查询参数 (如 x-signature), 
-                            // 因为它们是访问图片所必需的认证信息。
-                            // 但我们仍然可以检查URL的主体部分是否指向一张图片。
-                            const baseUrl = bestUrl.split('?')[0];
-                            if (baseUrl.endsWith('.jpg') || baseUrl.endsWith('.jpeg') || baseUrl.endsWith('.png') || baseUrl.endsWith('.gif')) {{
-                                urls.add(bestUrl); // 添加完整的、包含签名的URL
-                            }}
-                        }}
-                    }}
-                    return Array.from(urls);
-                }})()
-                """
-                urls_from_script = self.browser_manager.execute_script(js_script)
+        for selector in selectors_to_try:
+            escaped_selector = selector.replace('"', '\\"')
+            # 彻底简化脚本，严格、忠实地执行您配置的XPath，不再有任何"智能"过滤
+            js_script = f"""
+            (function() {{
+                const urls = new Set();
+                const query = document.evaluate("{escaped_selector}", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
                 
-                if urls_from_script:
-                    self.logger.info(f"使用选择器 '{selector}' 找到了 {len(urls_from_script)} 张图片。")
-                    image_urls.update(urls_from_script)
-
-            except Exception as e:
-                self.logger.warning(f"使用选择器 '{selector}' 时出错: {e}")
-                continue
-        
-        if not image_urls:
-            self.logger.warning("未能通过任何选择器提取到有效的图片URL。")
-        
-        # 将URL和Referer打包
-        for url in image_urls:
-            image_data_list.append({'url': url, 'referer': current_url})
-
-        self.logger.info(f"提取结束，共找到 {len(image_data_list)} 张不重复的图片。")
-        return image_data_list
-
-    def _extract_article_images(self):
-        """
-        在当前文章页面中提取所有图片链接。
-        该版本恢复了稳健的策略：滚动页面、尝试多种选择器、检查多种属性。
-        """
-        self.logger.info("开始提取文章图片...")
-        image_urls = set()
-
-        # 1. 滚动页面以触发懒加载
-        self.logger.info("滚动页面以加载所有图片...")
-        self.browser_manager.scroll_to_bottom(steps=15, delay=0.3)
-        time.sleep(3)  # 等待图片资源加载
-
-        # 2. 从配置文件获取图片选择器列表
-        selectors = self.config.get('selectors', {}).get('article_page', {}).get('image_selectors', [])
-        if not selectors:
-            self.logger.error("配置文件中未定义 'image_selectors'。")
-            return []
-
-        self.logger.info(f"将要尝试的选择器: {selectors}")
-
-        # 3. 遍历所有选择器寻找图片元素
-        for selector in selectors:
-            try:
-                # 使用JS脚本一次性提取所有符合条件的图片URL，效率更高
-                escaped_selector = selector.replace('"', '\\"')
-                js_script = f"""
-                (function() {{
-                    const urls = new Set();
-                    const query = document.evaluate("{escaped_selector}", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (let i = 0; i < query.snapshotLength; i++) {{
+                    let img = query.snapshotItem(i);
+                    // 智能检查多个属性，优先使用data-src等懒加载属性
+                    let bestUrl = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('src');
                     
-                    for (let i = 0; i < query.snapshotLength; i++) {{
-                        let img = query.snapshotItem(i);
-                        // 尝试从多个属性获取URL，这是处理懒加载的关键
-                        for (const attr of ['src', 'data-src', 'data-original', 'data-original-src']) {{
-                            let url = img.getAttribute(attr);
-                            if (url && url.startsWith('http')) {{
-                                // 清洗URL，去掉查询参数
-                                const cleanedUrl = url.split('?')[0];
-                                if (cleanedUrl.endsWith('.jpg') || cleanedUrl.endsWith('.jpeg') || cleanedUrl.endsWith('.png') || cleanedUrl.endsWith('.gif')) {{
-                                    urls.add(cleanedUrl);
-                                    break; // 找到有效URL后，不再检查此元素的其他属性
-                                }}
-                            }}
-                        }}
+                    if (bestUrl && bestUrl.startsWith('http')) {{
+                        // 不再对URL做任何清洗，保留包含签名的完整URL
+                        urls.add(bestUrl);
                     }}
-                    return Array.from(urls);
-                }})()
-                """
-                urls_from_script = self.browser_manager.execute_script(js_script)
-                
-                if urls_from_script:
-                    self.logger.info(f"使用选择器 '{selector}' 找到了 {len(urls_from_script)} 张图片。")
-                    image_urls.update(urls_from_script)
-
-            except Exception as e:
-                self.logger.warning(f"使用选择器 '{selector}' 时出错: {e}")
-                continue
+                }}
+                return Array.from(urls);
+            }})()
+            """
+            urls_from_script = self.browser_manager.execute_script(js_script)
+            
+            if urls_from_script:
+                self.logger.info(f"成功! 使用选择器 '{selector}' 找到了 {len(urls_from_script)} 张图片。将使用这些图片并停止查找。")
+                # 组装返回结果
+                return [{'url': url, 'referer': current_url} for url in urls_from_script]
         
-        if not image_urls:
-            self.logger.warning("未能通过任何选择器提取到有效的图片URL。")
-        
-        final_urls = list(image_urls)
-        self.logger.info(f"提取结束，共找到 {len(final_urls)} 张不重复的图片。")
-        return final_urls
+        self.logger.warning(f"尝试了所有选择器，但均未能找到任何图片。")
+        return []
 
     def _go_to_next_page(self):
         """翻到下一页"""

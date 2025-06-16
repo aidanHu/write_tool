@@ -72,9 +72,17 @@
     "search_retries": 3,
     "content_extract_retries": 2
   },
+  "scraping": {
+    "max_articles": 10,
+    "max_pages": 3,
+    "max_images": 5,
+    "delay_between_requests": 2,
+    "content_min_length": 100,
+    "crop_bottom_pixels": 90
+  },
   "random_delays": {
-    "min_delay": 2,
-    "max_delay": 5,
+    "min_delay": 1,
+    "max_delay": 2,
     "between_articles": true,
     "between_pages": true
   }

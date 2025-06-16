@@ -4,32 +4,41 @@ import pandas as pd
 class TitleReader:
     def __init__(self, file_path):
         self.file_path = file_path
-        
-        # 先尝试读取文件，检查是否有列名
+        self.is_valid = False
+        self.df = pd.DataFrame(columns=['标题', '状态']) # 准备一个空的、结构正确的df
+
         try:
-            # 先读取前几行来判断格式
-            df_peek = pd.read_excel(file_path, nrows=2)
-            
-            # 如果第一行看起来像列名（包含"标题"、"状态"等），则使用header=0
-            if len(df_peek.columns) >= 1 and ('标题' in str(df_peek.columns[0]) or 
-                                              df_peek.iloc[0, 0] in ['标题', 'title', 'Title']):
-                self.df = pd.read_excel(file_path, header=0)
-                # 确保列名正确
-                if len(self.df.columns) == 1:
-                    self.df.columns = ['标题']
-                    self.df['状态'] = None
-                elif len(self.df.columns) >= 2:
-                    self.df.columns = ['标题', '状态'] + [f'列{i}' for i in range(2, len(self.df.columns))]
+            # 1. 始终以无表头模式读取，避免pandas的自动判断引入不确定性
+            df_raw = pd.read_excel(file_path, header=None)
+
+            # 2. 如果文件是空的，直接使用上面准备好的空df即可
+            if df_raw.empty:
+                self.is_valid = True
+                return
+
+            # 3. 检查第一行是否像表头
+            first_row_values = [str(v).strip() for v in df_raw.iloc[0].values]
+            if '标题' in first_row_values or 'title' in first_row_values or 'Title' in first_row_values:
+                # 第一行是表头，用它来重命名列，并移除这一行
+                self.df = df_raw.rename(columns=df_raw.iloc[0]).drop(df_raw.index[0]).reset_index(drop=True)
             else:
-                # 没有列名，直接读取
-                self.df = pd.read_excel(file_path, header=None)
-                if len(self.df.columns) == 1:
-                    self.df[1] = None
+                # 第一行就是数据
+                self.df = df_raw
+
+            # 4. 标准化列名和结构
+            # 确保至少有'标题'和'状态'两列，并按此顺序命名
+            if len(self.df.columns) >= 2:
+                self.df = self.df.iloc[:, :2] # 只取前两列
+                self.df.columns = ['标题', '状态']
+            elif len(self.df.columns) == 1:
+                self.df.columns = ['标题']
+                self.df['状态'] = pd.NA # 添加状态列
+
+            self.is_valid = True
+
         except Exception as e:
-            print(f"Excel文件保存失败: {str(e)}")
-            return False
-        
-        # 可根据详细模型适配标题读取逻辑
+            print(f"Excel文件处理失败: {str(e)}")
+            self.is_valid = False
 
     def get_next_title(self):
         for idx, row in self.df.iterrows():
