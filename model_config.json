@@ -7,6 +7,6 @@
   "monica": {
     "gpt-4.1": "https://monica.im/home/chat/GPT-4.1/gpt_4_1",
     "Claude3.7": "https://monica.im/home/chat/Claude%203.7%20Sonnet/claude_3_7_sonnet",
-    "Gemini-Pro": "https://monica.im/home/chat/Gemini-Pro/gemini_pro"
+    "Gemini2.5Pro": "https://monica.im/home/chat/Gemini%202.5%20Pro/gemini_2_5_pro"
   }
 } 

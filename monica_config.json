@@ -1,0 +1,18 @@
+{
+    "selectors": {
+        "chat": {
+            "chat_input": "//textarea[@data-input_node='monica-chat-input' and not(@style[contains(., 'display: none')]) and not(ancestor::*[contains(@style, 'display: none')])]",
+            "upload_button": "//*[@id='monica-bot-renderer']/div[3]/div/div[4]/div[2]/div[1]/span[contains(@class, 'chat-toolbar-item')]",
+            "file_input": "//input[@type='file']",
+            "send_button": "//*[@id='monica-bot-renderer']/div[3]//div[contains(@class, 'input-msg-btn')]",
+            "stop_button": "//*[@id='monica-bot-renderer']/div[3]/div/div[4]/div[1]/div/div",
+            "last_response": "(//*[@id='monica-chat-scroll-box']/div/div/div[last()]/div[2]/div[1])[1]"
+        }
+    },
+    "timeouts": {
+        "page_load": 60,
+        "ai_response_wait": 600,
+        "typing_check_interval": 3
+    },
+    "urls": {}
+} 

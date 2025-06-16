@@ -9,6 +9,7 @@ from markdownify import markdownify as md
 from .title_reader import TitleReader
 from .toutiao_scraper import ToutiaoScraper
 from .poe_automator import PoeAutomator
+from .monica_automator import MonicaAutomator
 
 class WorkflowThread(QThread):
     """
@@ -46,82 +47,76 @@ class WorkflowThread(QThread):
             # 1. 初始化
             title_reader = TitleReader(self.config['title_file_path'])
             if not title_reader.is_valid:
-                print("TitleReader初始化失败，请检查Excel文件路径或文件内容。工作流终止。")
+                self.error.emit("TitleReader初始化失败，请检查Excel文件路径或文件内容。")
                 return
 
             titles_to_process = title_reader.get_all_pending_titles()
             total_tasks = len(titles_to_process)
             
             if not titles_to_process:
-                print("所有标题都已处理完毕，无需执行新任务。")
+                self.finished.emit("所有标题都已处理完毕，无需执行新任务。")
                 return
 
             # 2. 在循环外，根据GUI设置，一次性确定本次运行的工作流程
             should_scrape_articles = self.config.get('enable_article_collect', False)
             should_scrape_images = self.config.get('enable_image_collect', False)
-            should_run_poe = not (self.config.get('toutiao_scrape_only', False) and not self.config.get('poe_generate_only', False))
             
-            print("\n" + "="*50)
-            print(" 工作流程已确定 ".center(50, "="))
-            print(f"抓取文章: {'是' if should_scrape_articles else '否'}")
-            print(f"抓取图片 (并上传七牛云): {'是' if should_scrape_images else '否'}")
-            print(f"执行Poe创作: {'是' if should_run_poe else '否'}")
-            print("="*50 + "\n")
+            # 根据选择的模型决定执行哪个平台的创作
+            selected_model = self.config.get('model')
+            automator = None
+            run_workflow_func = None
 
-            poe_automator = None
-            if should_run_poe:
-                poe_automator = self._init_poe_automator()
-                if not poe_automator:
-                    print("Poe模块初始化失败，无法继续执行Poe创作流程。")
-                    return # 如果需要Poe但初始化失败，则终止
+            if selected_model == 'poe':
+                automator = self._init_automator(PoeAutomator, 'Poe')
+                run_workflow_func = self._run_poe_workflow
+            elif selected_model == 'monica':
+                automator = self._init_automator(MonicaAutomator, 'Monica')
+                run_workflow_func = self._run_monica_workflow
+            
+            if not automator:
+                self.error.emit(f"无法初始化 {selected_model} 的自动化模块。")
+                return
+
+            self.logger.info(f"将使用 {selected_model} 进行创作。")
 
             # --- 3. 主循环开始 ---
             for i, (index, title) in enumerate(titles_to_process):
-                print(f"\n======== [ {i+1}/{total_tasks} ] 开始新任务: {title} ========")
+                self.logger.info(f"\n======== [ {i+1}/{total_tasks} ] 开始新任务: {title} ========")
                 
                 # a. 按需执行头条抓取
                 if should_scrape_articles or should_scrape_images:
                     if not self._run_toutiao_workflow(title, should_scrape_articles, should_scrape_images):
-                        print(f"--- 任务 '{title}' 的头条抓取失败，跳过此任务 ---")
+                        self.logger.error(f"--- 任务 '{title}' 的头条抓取失败，跳过此任务 ---")
                         title_reader.mark_failed(index) # 标记为失败
                         continue
                 
-                # b. 按需执行Poe创作流程
-                if should_run_poe:
-                    article_to_upload = 'article.txt' if should_scrape_articles and os.path.exists('article.txt') else None
-                    if self._run_poe_workflow(poe_automator, title, article_to_upload):
-                        completed_count += 1
-                        title_reader.mark_finished(index)
-                    else:
-                        print(f"--- 任务 '{title}' 的Poe创作流程失败 ---")
-                        title_reader.mark_failed(index) # 标记为失败
-                else:
-                    # 如果只抓取，不创作，也算作完成
+                # b. 执行选定平台的创作流程
+                article_to_upload = 'article.txt' if should_scrape_articles and os.path.exists('article.txt') else None
+                if run_workflow_func(automator, title, article_to_upload):
                     completed_count += 1
                     title_reader.mark_finished(index)
+                else:
+                    self.logger.error(f"--- 任务 '{title}' 的 {selected_model} 创作流程失败 ---")
+                    title_reader.mark_failed(index) # 标记为失败
 
         except Exception as e:
-            print(f"工作流发生严重错误: {e}")
-            traceback.print_exc()
+            self.logger.error(f"工作流发生严重错误: {e}\n{traceback.format_exc()}")
+            self.error.emit(f"工作流发生严重错误: {e}")
         finally:
-            if 'poe_automator' in locals() and poe_automator:
-                poe_automator.cleanup()
-            print(f"\n======== 工作流结束: {completed_count}/{total_tasks} 个任务成功完成 ========")
+            if automator and hasattr(automator, 'cleanup'):
+                automator.cleanup()
+            # self.browser_manager.close_browser()
+            self.finished.emit(f"工作流结束: {completed_count}/{total_tasks} 个任务成功完成。")
 
-    def _init_poe_automator(self):
-        """初始化PoeAutomator实例"""
+    def _init_automator(self, automator_class, automator_name):
+        """通用初始化方法"""
         try:
-            model_config_path = self.config.get('model_config_path', 'model_config.json')
-            with open(model_config_path, 'r', encoding='utf-8') as f:
-                model_urls = json.load(f)
-            platform = self.config.get('model')
-            model_detail = self.config.get('model_detail')
-            model_url = model_urls.get(platform, {}).get(model_detail)
+            model_url = self.config.get('model_url')
             if not model_url:
-                raise ValueError(f"未在 {model_config_path} 中找到模型URL。")
-            return PoeAutomator(self.config, self.browser_manager, model_url=model_url)
+                raise ValueError(f"未在配置中找到模型URL。")
+            return automator_class(self.config, self.browser_manager, model_url=model_url)
         except Exception as e:
-            self.error.emit(f"PoeAutomator初始化失败: {e}")
+            self.error.emit(f"{automator_name}Automator初始化失败: {e}")
             return None
 
     def _run_toutiao_workflow(self, keyword, scrape_articles, scrape_images):
@@ -131,7 +126,7 @@ class WorkflowThread(QThread):
             scraper = ToutiaoScraper(self.config, self.browser_manager)
             return scraper.scrape_articles_and_images(keyword, scrape_articles, scrape_images)
         except Exception as e:
-            print(f"头条抓取工作流程执行失败: {str(e)}")
+            self.logger.error(f"头条抓取工作流程执行失败: {str(e)}")
             return False
 
     def _run_poe_workflow(self, poe_automator, title, article_path):
@@ -153,16 +148,16 @@ class WorkflowThread(QThread):
         # 使用更准确的字数统计方法
         cleaned_text = re.sub(r'[\s\W_]+', '', markdown_content)
         word_count = len(cleaned_text)
-        print(f"首次生成完成，字数: {word_count} (要求: {min_word_count})")
+        self.logger.info(f"首次生成完成，字数: {word_count} (要求: {min_word_count})")
 
         if word_count < min_word_count:
-            print("字数不足，开始二次创作...")
+            self.logger.info("字数不足，开始二次创作...")
             html_content = poe_automator.continue_generation(continue_prompt)
             if html_content:
                 markdown_content = md(html_content, heading_style='ATX')
-                print("二次创作完成。")
+                self.logger.info("二次创作完成。")
             else:
-                print("二次创作失败，将使用当前内容。")
+                self.logger.warning("二次创作失败，将使用当前内容。")
 
         # 3. 在插入图片前，清理Poe生成的内容
         self.logger.info("清理Poe生成内容，移除H1标题和底部时间戳...")
@@ -199,6 +194,61 @@ class WorkflowThread(QThread):
         output_filename = os.path.join(self.config['save_path'], f"{safe_title}.md")
         
         return poe_automator.save_content(markdown_content, output_filename)
+
+    def _run_monica_workflow(self, monica_automator, title, article_path):
+        """为单个标题运行Monica自动化工作流程"""
+        main_prompt_template = self.config.get('prompt', "以'{title}'为标题写一篇文章。")
+        continue_prompt = self.config.get('continue_prompt', '请继续写，内容要更丰富。')
+        min_word_count = self.config.get('min_word_count', 800)
+        
+        # 处理复杂的提示词模板
+        # 如果提示词模板中包含"{title}"或"主题："等标记，正确替换
+        if '{title}' in main_prompt_template:
+            # 标准的格式化替换
+            main_prompt = main_prompt_template.format(title=title)
+        elif main_prompt_template.endswith('主题：'):
+            # 如果模板以"主题："结尾，直接追加标题
+            main_prompt = main_prompt_template + title
+        elif '主题：' in main_prompt_template:
+            # 如果模板包含"主题："但不是结尾，进行替换
+            # 寻找"主题："后面的内容并替换
+            main_prompt = re.sub(r'主题：[^\n]*', f'主题：{title}', main_prompt_template)
+        else:
+            # 如果都没有，采用原来的方式，在末尾添加标题
+            main_prompt = f"{main_prompt_template}\n\n主题：{title}"
+        
+        self.logger.info(f"准备发送的完整提示词: 包含标题 '{title}' 的 {len(main_prompt)} 字符提示词")
+        
+        # 1. 首次生成
+        html_content = monica_automator.generate_content(prompt=main_prompt, article_file=article_path)
+        if not html_content:
+            return False
+
+        # 2. 检查字数并二次创作
+        markdown_content = md(html_content, heading_style='ATX')
+        
+        cleaned_text = re.sub(r'[\s\W_]+', '', markdown_content)
+        word_count = len(cleaned_text)
+        self.logger.info(f"首次生成完成，字数: {word_count} (要求: {min_word_count})")
+
+        if word_count < min_word_count:
+            self.logger.info("字数不足，开始二次创作...")
+            html_content = monica_automator.continue_generation(continue_prompt)
+            if html_content:
+                markdown_content = md(html_content, heading_style='ATX')
+                self.logger.info("二次创作完成。")
+            else:
+                self.logger.warning("二次创作失败，将使用当前内容。")
+
+        # 3. 按需插入图片
+        if self.config.get('enable_image_collect', False):
+            markdown_content = self._insert_pictures(markdown_content)
+        
+        # 4. 保存
+        safe_title = "".join(x for x in title if x.isalnum() or x in " -_").rstrip()
+        output_filename = os.path.join(self.config['save_path'], f"{safe_title}.md")
+        
+        return monica_automator.save_content(markdown_content, output_filename)
 
     def _insert_pictures(self, markdown_content):
         """

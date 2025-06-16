@@ -25,3 +25,5 @@ picture.txt
 write_tool_chrome_profile/
 picture.txt
 *.txt
+/gui/__pycache__
+picture.txt

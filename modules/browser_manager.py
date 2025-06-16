@@ -199,7 +199,7 @@ class BrowserManager:
             self.logger.error(f"发送命令失败: {method}, 错误: {e}")
             return None
     
-    def navigate_to(self, url):
+    def navigate(self, url):
         """导航到指定URL"""
         try:
             self.logger.info(f"导航到: {url}")
@@ -585,88 +585,105 @@ class BrowserManager:
     
     def focus_and_type_text(self, xpath: str, text: str, clear_first: bool = True, timeout: int = 10) -> bool:
         """
-        使用单一、原子的JavaScript执行来定位、聚焦、清空和输入文本。
-        包含了一个等待机制，在超时前会持续尝试查找元素。
+        一个更健壮的输入方法，它将长文本分块传输到浏览器，然后在浏览器端一次性拼接并设置值。
+        这能同时绕过CDP传输大小限制和某些网站对高频修改value的bug。
         """
-        self.logger.info(f"准备以原子方式向XPath元素 '{xpath}' 输入文本（超时时间: {timeout}s）。")
-        
-        js_escaped_text = text.replace('\\', '\\\\').replace('`', '\\`')
+        self.logger.info(f"准备以'分块传输、一次性设置'方式向XPath '{xpath}' 输入文本...")
+        try:
+            # 1. 初始化一个用于暂存文本块的全局数组
+            init_script = "window.prompt_chunks = [];"
+            self.execute_script(init_script)
 
-        script = f"""
-        (async function() {{
-            const xpath = '{xpath}';
-            const timeout = {timeout * 1000}; // JS uses milliseconds
-            const startTime = Date.now();
+            # 2. 将文本分块，并逐块发送到浏览器暂存
+            chunk_size = 1024  # 增加块大小以提高效率
+            text_chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+            
+            for i, chunk in enumerate(text_chunks):
+                js_chunk = json.dumps(chunk)
+                push_script = f"window.prompt_chunks.push({js_chunk});"
+                self.execute_script(push_script)
+                self.logger.info(f"已发送第 {i + 1}/{len(text_chunks)} 批次的数据到浏览器。")
 
-            while (Date.now() - startTime < timeout) {{
-                const element = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                if (element) {{
-                    console.log('CDP script: Element found.');
-                    element.focus();
+            # 3. 发送最终指令：拼接、设置、触发事件、清理
+            js_xpath = json.dumps(xpath)
+            final_script = f"""
+            (function() {{
+                try {{
+                    if (!window.prompt_chunks || window.prompt_chunks.length === 0) {{
+                        return {{ success: false, error: 'No text chunks found in window.' }};
+                    }}
+                    var final_text = window.prompt_chunks.join('');
                     
-                    if ({str(clear_first).lower()}) {{
-                        element.value = '';
+                    var element = document.evaluate({js_xpath}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    if (!element) {{
+                        return {{ success: false, error: 'Element not found' }};
                     }}
                     
-                    element.value = `{js_escaped_text}`;
+                    // 使用原生值设置器 (native value setter) 来赋值。
+                    // 这对于绕过像React这样的前端框架的事件包装器至关重要，确保框架能够正确地"感知"到值的变化。
+                    // 直接使用 element.value = ... 可能不会触发框架所需的更改检测。
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
                     
-                    element.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
-                    element.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                    element.focus();
                     
-                    console.log('CDP script: Successfully set value for element.');
+                    nativeInputValueSetter.call(element, final_text);
+                    
+                    // 手动分发 'input' 事件，以模拟用户输入并触发任何相关的事件监听器。
+                    var inputEvent = new Event('input', {{ bubbles: true }});
+                    element.dispatchEvent(inputEvent);
+                    
                     return {{ success: true }};
+                    
+                }} catch (e) {{
+                    return {{ success: false, error: e.toString() }};
+                }} finally {{
+                    delete window.prompt_chunks; // 清理全局变量
                 }}
-                await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms before retrying
-            }}
+            }})()
+            """
+            result = self.execute_script(final_script, await_promise=True)
             
-            console.error(`CDP script: Element not found for XPath: ${{xpath}} after {timeout / 1000} seconds.`);
-            return {{ success: false, error: 'Element not found within timeout' }};
-        }})();
-        """
-        try:
-            # 直接调用底层命令，并获取完整的返回负载
-            result_payload = self._send_command("Runtime.evaluate", {
-                "expression": script,
-                "returnByValue": True,
-                "awaitPromise": True,
-                "timeout": (timeout + 1) * 1000
-            })
-
-            # 1. 检查CDP命令是否成功执行并返回了'result'字段
-            if not result_payload or 'result' not in result_payload:
-                self.logger.error(f"CDP命令失败或返回无效结构: {result_payload}")
+            if result and result.get('success'):
+                self.logger.info("分块传输、一次性设置脚本执行成功。")
+                return True
+            else:
+                error_msg = result.get('error', '未知JS错误') if result else '脚本未返回结果'
+                self.logger.error(f"最终设置脚本执行失败: {error_msg}")
                 return False
-
-            # 2. 提取评估结果
-            evaluation_result = result_payload['result']
-
-            # 3. 优先检查JS执行期间是否发生异常
-            if 'exceptionDetails' in evaluation_result:
-                exception_details = evaluation_result['exceptionDetails']
-                error_text = exception_details.get('text', '')
-                exception_desc = exception_details.get('exception', {}).get('description', '')
-                self.logger.error(f"JavaScript执行时捕获到异常: {error_text} {exception_desc}")
-                return False
-
-            # 4. 正确解析成功的返回结构
-            if 'result' in evaluation_result and 'value' in evaluation_result['result']:
-                js_return_value = evaluation_result['result']['value']
-                if js_return_value and js_return_value.get('success'):
-                    self.logger.info("原子化输入脚本执行成功。")
-                    return True
-                else:
-                    error_msg = js_return_value.get('error', '未知JS错误') if js_return_value else '脚本未返回结果'
-                    self.logger.warning(f"原子化输入脚本执行失败: {error_msg}")
-                    return False
-            
-            # 5. 如果以上条件都不满足，说明返回了未预料到的结构
-            self.logger.error(f"执行原子化输入脚本时返回了意外的成功结构: {result_payload}")
-            return False
 
         except Exception as e:
-            self.logger.error(f"执行原子化输入脚本时发生Python异常: {e}", exc_info=True)
+            self.logger.error(f"执行'分块传输'脚本时发生Python异常: {e}", exc_info=True)
             return False
-    
+
+    def get_element_value(self, xpath: str) -> Optional[str]:
+        """获取指定XPath元素的value属性。"""
+        self.logger.info(f"正在获取XPath元素的value: {xpath}")
+        try:
+            js_xpath = json.dumps(xpath)
+            script = f"""
+            (function() {{
+                const element = document.evaluate({js_xpath}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (element && typeof element.value !== 'undefined') {{
+                    return {{ success: true, value: element.value }};
+                }} else if (element) {{
+                    return {{ success: false, error: 'Element found, but has no value property.' }};
+                }} else {{
+                    return {{ success: false, error: 'Element not found.' }};
+                }}
+            }})()
+            """
+            result = self.execute_script(script, await_promise=True)
+            if result and result.get('success'):
+                self.logger.info("成功获取元素value。")
+                return result.get('value')
+            else:
+                error_msg = result.get('error', '未知错误') if result else "执行JS未返回结果"
+                self.logger.error(f"获取元素value失败: {error_msg}")
+                return None
+        except Exception as e:
+            self.logger.error(f"获取元素value时发生异常: {e}", exc_info=True)
+            return None
+
     def get_element_text(self, element_info):
         """获取元素文本"""
         try:
@@ -1726,12 +1743,114 @@ class BrowserManager:
                 self.switch_to_tab_by_id(original_tab_id)
 
     def _check_for_captcha(self):
-        """检查并处理机器人验证"""
+        """检查页面是否出现验证码"""
+        captcha_selectors = [
+            "iframe[src*='recaptcha']",
+            ".captcha",
+            "#captcha",
+            "[class*='captcha']"
+        ]
+        
+        for selector in captcha_selectors:
+            if self.is_element_present(selector):
+                self.logger.warning("检测到验证码，可能需要手动处理")
+                return True
+        return False
+
+    def wait_for_element_by_xpath(self, xpath: str, timeout: int = 10) -> bool:
+        """等待XPath元素出现"""
+        self.logger.info(f"等待XPath元素出现: {xpath} (超时: {timeout}秒)")
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                element = self._find_element_by_xpath(xpath, timeout=1)
+                if element:
+                    self.logger.info(f"XPath元素已找到: {xpath}")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"查找XPath元素时出错: {e}")
+            
+            time.sleep(0.5)
+        
+        self.logger.warning(f"等待XPath元素超时: {xpath}")
+        return False
+
+    def wait_for_element_to_disappear_by_xpath(self, xpath: str, timeout: int = 10) -> bool:
+        """等待XPath元素消失"""
+        self.logger.info(f"等待XPath元素消失: {xpath} (超时: {timeout}秒)")
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                element = self._find_element_by_xpath(xpath, timeout=1)
+                if not element:
+                    self.logger.info(f"XPath元素已消失: {xpath}")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"查找XPath元素时出错: {e}")
+            
+            time.sleep(0.5)
+        
+        self.logger.warning(f"等待XPath元素消失超时: {xpath}")
+        return False
+
+    def input_text_by_xpath_js(self, xpath: str, text: str) -> bool:
+        """使用JavaScript直接设置文本内容，类似用户提供的工作代码"""
+        self.logger.info(f"使用JS向XPath元素输入文本: {xpath}")
+        
+        # 转义文本中的特殊字符
+        escaped_text = text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+        escaped_xpath = xpath.replace('"', '\\"')
+        
+        js_script = f"""
+        (function() {{
+            try {{
+                const xpath = "{escaped_xpath}";
+                const text = "{escaped_text}";
+                
+                // 查找元素
+                const element = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                
+                if (element) {{
+                    // 获取原生的value setter
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set ||
+                                                   Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                    
+                    // 聚焦元素
+                    element.focus();
+                    
+                    // 设置值
+                    if (nativeInputValueSetter) {{
+                        nativeInputValueSetter.call(element, text);
+                    }} else {{
+                        element.value = text;
+                    }}
+                    
+                    // 触发input事件
+                    element.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    element.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    
+                    return {{ success: true, message: "文本输入成功" }};
+                }} else {{
+                    return {{ success: false, message: "未找到元素" }};
+                }}
+            }} catch (error) {{
+                return {{ success: false, message: "错误: " + error.message }};
+            }}
+        }})()
+        """
+        
         try:
-            # ... existing code ...
-            pass
+            result = self.execute_script(js_script)
+            if result and result.get('success'):
+                self.logger.info(f"JS文本输入成功: {result.get('message', '')}")
+                return True
+            else:
+                self.logger.error(f"JS文本输入失败: {result.get('message', '未知错误') if result else '无返回结果'}")
+                return False
         except Exception as e:
-            self.logger.error(f"检查并处理机器人验证时出错: {e}", exc_info=True)
+            self.logger.error(f"执行JS文本输入时出错: {e}")
             return False
 
 
