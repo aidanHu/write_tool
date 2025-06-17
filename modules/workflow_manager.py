@@ -2,14 +2,16 @@ from PyQt6.QtCore import QThread, pyqtSignal
 import os
 import traceback
 import json
-import random
 import re
 import logging
-from markdownify import markdownify as md
-from .title_reader import TitleReader
+import asyncio
+
 from .toutiao_scraper import ToutiaoScraper
 from .poe_automator import PoeAutomator
 from .monica_automator import MonicaAutomator
+from typing import Optional, List, Dict, Any
+from .browser_manager import BrowserManager
+import pandas as pd
 
 class WorkflowThread(QThread):
     """
@@ -18,11 +20,12 @@ class WorkflowThread(QThread):
     """
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
+    log_signal = pyqtSignal(str) # 信号必须是类属性
 
-    def __init__(self, config, browser_manager, parent=None):
-        super().__init__(parent)
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
         self.config = config
-        self.browser_manager = browser_manager # 使用传入的实例
+        self.browser_manager = BrowserManager(headless=self.config.get('headless', True))
         self.logger = self._setup_logging()
 
     def _setup_logging(self):
@@ -38,279 +41,331 @@ class WorkflowThread(QThread):
         return logger
 
     def run(self):
-        """
-        根据GUI的配置，运行完整的工作流。
-        """
-        completed_count = 0
-        total_tasks = 0
+        """同步的线程入口点，负责设置并运行asyncio事件循环"""
+        self.log_signal.emit("工作流线程已启动...")
         try:
-            # 1. 初始化
-            title_reader = TitleReader(self.config['title_file_path'])
-            if not title_reader.is_valid:
-                self.error.emit("TitleReader初始化失败，请检查Excel文件路径或文件内容。")
+            # self.loop = asyncio.new_event_loop()
+            # asyncio.set_event_loop(self.loop)
+            asyncio.run(self.run_async())
+        except Exception as e:
+            self.log_signal.emit(f"线程启动或运行asyncio循环时出错: {e}")
+            traceback.print_exc()
+        finally:
+            self.log_signal.emit("工作流线程已结束。")
+
+    async def run_async(self):
+        """包含所有核心异步逻辑"""
+        try:
+            self.log_signal.emit("正在启动浏览器...")
+            if not await self.browser_manager.launch():
+                self.log_signal.emit("启动浏览器失败！")
+                return
+            self.log_signal.emit("浏览器启动成功。")
+            
+            titles = self._load_titles_from_excel(self.config['title_path'])
+            if not titles:
+                self.log_signal.emit("Excel文件中没有找到标题，任务结束。")
                 return
 
-            titles_to_process = title_reader.get_all_pending_titles()
-            total_tasks = len(titles_to_process)
-            
-            if not titles_to_process:
-                self.finished.emit("所有标题都已处理完毕，无需执行新任务。")
-                return
+            self.log_signal.emit(f"成功加载 {len(titles)} 个任务标题。")
 
-            # 2. 在循环外，根据GUI设置，一次性确定本次运行的工作流程
-            should_scrape_articles = self.config.get('enable_article_collect', False)
-            should_scrape_images = self.config.get('enable_image_collect', False)
-            
-            # 根据选择的模型决定执行哪个平台的创作
-            selected_model = self.config.get('model')
-            automator = None
-            run_workflow_func = None
-
-            if selected_model == 'poe':
-                automator = self._init_automator(PoeAutomator, 'Poe')
-                run_workflow_func = self._run_poe_workflow
-            elif selected_model == 'monica':
-                automator = self._init_automator(MonicaAutomator, 'Monica')
-                run_workflow_func = self._run_monica_workflow
-            
-            if not automator:
-                self.error.emit(f"无法初始化 {selected_model} 的自动化模块。")
-                return
-
-            self.logger.info(f"将使用 {selected_model} 进行创作。")
-
-            # --- 3. 主循环开始 ---
-            for i, (index, title) in enumerate(titles_to_process):
-                self.logger.info(f"\n======== [ {i+1}/{total_tasks} ] 开始新任务: {title} ========")
+            for index, title in enumerate(titles):
+                self.log_signal.emit(f"\n--- 开始处理任务 {index + 1}/{len(titles)}: {title} ---")
                 
-                # a. 按需执行头条抓取
+                # 清理旧的输出文件
+                self._clear_file("article.txt")
+                self._clear_file("picture.txt")
+
+                should_scrape_articles = self.config.get('enable_article_collect', False)
+                should_scrape_images = self.config.get('enable_image_collect', False)
+
                 if should_scrape_articles or should_scrape_images:
-                    if not self._run_toutiao_workflow(title, should_scrape_articles, should_scrape_images):
-                        self.logger.error(f"--- 任务 '{title}' 的头条抓取失败，跳过此任务 ---")
-                        title_reader.mark_failed(index) # 标记为失败
+                    self.log_signal.emit("正在启动今日头条抓取器...")
+                    toutiao_scraper = ToutiaoScraper(self.config, self.browser_manager)
+                    success = await toutiao_scraper.scrape_articles_and_images(
+                        keyword=title,
+                        scrape_articles=should_scrape_articles,
+                        scrape_images=should_scrape_images
+                    )
+                    if not success:
+                        self.log_signal.emit("今日头条抓取失败，跳过此任务。")
                         continue
                 
-                # b. 执行选定平台的创作流程
-                article_to_upload = 'article.txt' if should_scrape_articles and os.path.exists('article.txt') else None
-                if run_workflow_func(automator, title, article_to_upload):
-                    completed_count += 1
-                    title_reader.mark_finished(index)
+                # 确定要上传的附件
+                article_to_upload = None
+                if self.config.get('enable_custom_attachment'):
+                    custom_path = self.config.get('custom_attachment_path', '').strip()
+                    if custom_path and os.path.exists(custom_path):
+                        article_to_upload = custom_path
+                        self.log_signal.emit(f"使用自定义附件: {custom_path}")
+                    elif custom_path:
+                        self.log_signal.emit(f"警告：自定义附件路径不存在: {custom_path}")
+                    else:
+                        self.log_signal.emit("警告：自定义附件路径为空")
+                elif should_scrape_articles and os.path.exists("article.txt"):
+                    article_to_upload = "article.txt"
+                    self.log_signal.emit("使用抓取的文章作为附件: article.txt")
+                
+                if article_to_upload:
+                    self.log_signal.emit(f"将上传附件: {article_to_upload}")
                 else:
-                    self.logger.error(f"--- 任务 '{title}' 的 {selected_model} 创作流程失败 ---")
-                    title_reader.mark_failed(index) # 标记为失败
+                    self.log_signal.emit("没有附件需要上传")
+
+                # 开始文章生成流程
+                platform = self.config.get('model', 'poe').lower()
+                if platform == 'poe':
+                    self.log_signal.emit("开始 POE 文章生成流程...")
+                    workflow_success = await self._run_poe_workflow(title, article_to_upload)
+                elif platform == 'monica':
+                    self.log_signal.emit("开始 Monica 文章生成流程...")
+                    workflow_success = await self._run_monica_workflow(title, article_to_upload)
+                else:
+                    self.log_signal.emit(f"未知的平台: {platform}")
+                    workflow_success = False
+                
+                if workflow_success:
+                     self.log_signal.emit(f"--- 任务 {index + 1}/{len(titles)} 完成 ---\n")
+                     # 更新Excel状态
+                     self._update_excel_status(index, "已完成文章创作")
+                else:
+                    self.log_signal.emit(f"--- 任务 {index + 1}/{len(titles)} 失败 ---\n")
+                    # 更新Excel状态
+                    self._update_excel_status(index, "创作失败")
+
+                await asyncio.sleep(2) # 每个任务之间的短暂延迟
 
         except Exception as e:
-            self.logger.error(f"工作流发生严重错误: {e}\n{traceback.format_exc()}")
-            self.error.emit(f"工作流发生严重错误: {e}")
-        finally:
-            if automator and hasattr(automator, 'cleanup'):
-                automator.cleanup()
-            # self.browser_manager.close_browser()
-            self.finished.emit(f"工作流结束: {completed_count}/{total_tasks} 个任务成功完成。")
-
-    def _init_automator(self, automator_class, automator_name):
-        """通用初始化方法"""
-        try:
-            model_url = self.config.get('model_url')
-            if not model_url:
-                raise ValueError(f"未在配置中找到模型URL。")
-            return automator_class(self.config, self.browser_manager, model_url=model_url)
-        except Exception as e:
-            self.error.emit(f"{automator_name}Automator初始化失败: {e}")
-            return None
-
-    def _run_toutiao_workflow(self, keyword, scrape_articles, scrape_images):
-        """为单个关键词运行头条抓取流程"""
-        print(f"--- 开始为关键词 '{keyword}' 抓取头条内容 ---")
-        try:
-            scraper = ToutiaoScraper(self.config, self.browser_manager)
-            return scraper.scrape_articles_and_images(keyword, scrape_articles, scrape_images)
-        except Exception as e:
-            self.logger.error(f"头条抓取工作流程执行失败: {str(e)}")
-            return False
-
-    def _run_poe_workflow(self, poe_automator, title, article_path):
-        """为单个标题运行Poe自动化工作流程"""
-        main_prompt_template = self.config.get('prompt', "以'{title}'为标题写一篇文章。")
-        continue_prompt = self.config.get('continue_prompt', '请继续写，内容要更丰富。')
-        min_word_count = self.config.get('min_word_count', 800)
-        
-        main_prompt = main_prompt_template.format(title=title)
-        
-        # 1. 首次生成
-        html_content = poe_automator.generate_content(prompt=main_prompt, article_file=article_path)
-        if not html_content:
-            return False
-
-        # 2. 检查字数并二次创作
-        markdown_content = md(html_content, heading_style='ATX')
-        
-        # 使用更准确的字数统计方法
-        cleaned_text = re.sub(r'[\s\W_]+', '', markdown_content)
-        word_count = len(cleaned_text)
-        self.logger.info(f"首次生成完成，字数: {word_count} (要求: {min_word_count})")
-
-        if word_count < min_word_count:
-            self.logger.info("字数不足，开始二次创作...")
-            html_content = poe_automator.continue_generation(continue_prompt)
-            if html_content:
-                markdown_content = md(html_content, heading_style='ATX')
-                self.logger.info("二次创作完成。")
-            else:
-                self.logger.warning("二次创作失败，将使用当前内容。")
-
-        # 3. 在插入图片前，清理Poe生成的内容
-        self.logger.info("清理Poe生成内容，移除H1标题和底部时间戳...")
-        lines = markdown_content.split('\n')
-
-        # 移除H1标题 (通常是第一行)
-        if lines and lines[0].strip().startswith('# '):
-            self.logger.info(f"移除H1标题: {lines[0]}")
-            lines.pop(0)
-        
-        # 移除前导空行
-        while lines and not lines[0].strip():
-            lines.pop(0)
-
-        # 清理尾部空行
-        while lines and not lines[-1].strip():
-            lines.pop(-1)
-
-        # 检查并移除时间戳
-        if lines:
-            time_pattern = re.compile(r'^\\d{1,2}:\\d{2}$')
-            if time_pattern.match(lines[-1].strip()):
-                self.logger.info(f"发现并移除底部时间戳: '{lines[-1].strip()}'")
-                lines.pop(-1)
-        
-        markdown_content = '\n'.join(lines)
-
-        # 4. 按需插入图片
-        if self.config.get('enable_image_collect', False):
-            markdown_content = self._insert_pictures(markdown_content)
-        
-        # 5. 保存
-        safe_title = "".join(x for x in title if x.isalnum() or x in " -_").rstrip()
-        output_filename = os.path.join(self.config['save_path'], f"{safe_title}.md")
-        
-        return poe_automator.save_content(markdown_content, output_filename)
-
-    def _run_monica_workflow(self, monica_automator, title, article_path):
-        """为单个标题运行Monica自动化工作流程"""
-        main_prompt_template = self.config.get('prompt', "以'{title}'为标题写一篇文章。")
-        continue_prompt = self.config.get('continue_prompt', '请继续写，内容要更丰富。')
-        min_word_count = self.config.get('min_word_count', 800)
-        
-        # 处理复杂的提示词模板
-        # 如果提示词模板中包含"{title}"或"主题："等标记，正确替换
-        if '{title}' in main_prompt_template:
-            # 标准的格式化替换
-            main_prompt = main_prompt_template.format(title=title)
-        elif main_prompt_template.endswith('主题：'):
-            # 如果模板以"主题："结尾，直接追加标题
-            main_prompt = main_prompt_template + title
-        elif '主题：' in main_prompt_template:
-            # 如果模板包含"主题："但不是结尾，进行替换
-            # 寻找"主题："后面的内容并替换
-            main_prompt = re.sub(r'主题：[^\n]*', f'主题：{title}', main_prompt_template)
-        else:
-            # 如果都没有，采用原来的方式，在末尾添加标题
-            main_prompt = f"{main_prompt_template}\n\n主题：{title}"
-        
-        self.logger.info(f"准备发送的完整提示词: 包含标题 '{title}' 的 {len(main_prompt)} 字符提示词")
-        
-        # 1. 首次生成
-        html_content = monica_automator.generate_content(prompt=main_prompt, article_file=article_path)
-        if not html_content:
-            return False
-
-        # 2. 检查字数并二次创作
-        markdown_content = md(html_content, heading_style='ATX')
-        
-        cleaned_text = re.sub(r'[\s\W_]+', '', markdown_content)
-        word_count = len(cleaned_text)
-        self.logger.info(f"首次生成完成，字数: {word_count} (要求: {min_word_count})")
-
-        if word_count < min_word_count:
-            self.logger.info("字数不足，开始二次创作...")
-            html_content = monica_automator.continue_generation(continue_prompt)
-            if html_content:
-                markdown_content = md(html_content, heading_style='ATX')
-                self.logger.info("二次创作完成。")
-            else:
-                self.logger.warning("二次创作失败，将使用当前内容。")
-
-        # 3. 按需插入图片
-        if self.config.get('enable_image_collect', False):
-            markdown_content = self._insert_pictures(markdown_content)
-        
-        # 4. 保存
-        safe_title = "".join(x for x in title if x.isalnum() or x in " -_").rstrip()
-        output_filename = os.path.join(self.config['save_path'], f"{safe_title}.md")
-        
-        return monica_automator.save_content(markdown_content, output_filename)
-
-    def _insert_pictures(self, markdown_content):
-        """
-        将图片链接智能地插入到Markdown文本中。
-        优先插入到二级标题后，其次插入到段落之间。
-        """
-        print("--- 开始智能插入图片 ---")
-        try:
-            with open('picture.txt', 'r', encoding='utf-8') as f:
-                # 直接读取已是Markdown格式的图片链接
-                pictures = [line.strip() for line in f if line.strip()]
-            
-            if not pictures:
-                print("picture.txt 中没有图片链接，跳过插入。")
-                return markdown_content
-
-            lines = markdown_content.split('\n')
-            
-            # 查找所有二级标题的行号
-            h2_indices = [i for i, line in enumerate(lines) if line.strip().startswith('## ')]
-            
-            # 查找所有段落分隔处的行号（连续两个或更多换行符，表现为空行）
-            # 我们只在内容非空的行后面的空行插入
-            paragraph_break_indices = [i for i, line in enumerate(lines) if not line.strip() and i > 0 and lines[i-1].strip()]
-
-            # 优先使用二级标题后的位置
-            # 使用集合以避免重复
-            insertion_points = set(h2_indices)
-            
-            # 如果二级标题位置不够，用段落分隔处补充
-            if len(insertion_points) < len(pictures):
-                # 排除掉紧跟在标题或已选位置后面的段落分隔符，避免重复插入
-                available_para_breaks = [p for p in paragraph_break_indices if p-1 not in insertion_points]
-                needed = len(pictures) - len(insertion_points)
-                # 如果有可用的段落分隔符，随机挑选一些
-                if available_para_breaks:
-                    insertion_points.update(random.sample(available_para_breaks, min(needed, len(available_para_breaks))))
-
-            if not insertion_points:
-                print("未能在文章中找到合适的图片插入点（二级标题或段落），图片将不会被插入。")
-                return markdown_content
-
-            # 转换回列表并按倒序排序，以便安全地插入
-            sorted_points = sorted(list(insertion_points), reverse=True)
-            
-            num_to_insert = min(len(pictures), len(sorted_points))
-            pics_to_insert = pictures[:num_to_insert]
-
-            for i in range(num_to_insert):
-                pic_markdown = pics_to_insert[i]
-                insert_index = sorted_points[i]
-                # 插入到标题或段落的下一行，并确保前后都有空行，以符合Markdown语法
-                lines.insert(insert_index + 1, f"\n{pic_markdown}\n")
-
-            final_content = '\n'.join(lines)
-            print(f"成功将 {num_to_insert} 张图片智能插入到文章中。")
-            return final_content
-
-        except FileNotFoundError:
-            print("picture.txt 未找到，跳过图片插入。")
-            return markdown_content
-        except Exception as e:
-            print(f"插入图片时出错: {e}")
+            self.log_signal.emit(f"工作流执行期间发生严重错误: {e}")
             traceback.print_exc()
-            return markdown_content 
+            self.error.emit(f"工作流执行失败: {e}")
+        finally:
+            await self.cleanup()
+            self.log_signal.emit("所有任务已完成。")
+            self.finished.emit("工作流已完成")
+
+    async def _run_toutiao_workflow(self, scraper, keyword, scrape_articles, scrape_images):
+        """为单个关键词运行头条抓取流程"""
+        self.log_signal.emit(f"--- 开始为关键词 '{keyword}' 抓取头条内容 ---")
+        try:
+            return await scraper.scrape_articles_and_images(keyword, scrape_articles, scrape_images)
+        except Exception as e:
+            self.log_signal.emit(f"头条抓取工作流程执行失败: {str(e)}")
+            return False
+
+    async def _run_poe_workflow(self, title: str, article_path: Optional[str]) -> bool:
+        self.log_signal.emit("正在启动 Poe 工作流程...")
+        
+        # 获取模型URL
+        model_url = self.config.get('model_url')
+        if not model_url:
+            self.log_signal.emit("错误：未找到模型URL配置")
+            return False
+        
+        poe_automator = PoeAutomator(self.config, self.browser_manager, model_url)
+        try:
+            generated_article = await poe_automator.compose_article(
+                title,
+                attachment_path=article_path,
+                min_words=self.config.get('min_word_count', 800),
+                prompt=self.config.get('prompt', ''),
+                continue_prompt=self.config.get('continue_prompt', '')
+            )
+            if not generated_article:
+                self.log_signal.emit("Poe 未能生成文章。")
+                return False
+
+            self._save_article(title, generated_article)
+            return True
+        except Exception as e:
+            self.log_signal.emit(f"Poe 工作流程失败: {e}")
+            return False
+
+    async def _run_monica_workflow(self, title: str, article_path: Optional[str]) -> bool:
+        self.log_signal.emit("正在启动 Monica 工作流程...")
+        
+        # 获取模型URL
+        model_url = self.config.get('model_url')
+        if not model_url:
+            self.log_signal.emit("错误：未找到模型URL配置")
+            return False
+        
+        monica_automator = MonicaAutomator(self.config, self.browser_manager, model_url)
+        try:
+            if not await monica_automator.navigate_to_monica():
+                return False
+            
+            generated_article = await monica_automator.compose_article(
+                title,
+                attachment_path=article_path,
+                min_words=self.config.get('min_word_count', 800),
+                prompt=self.config.get('prompt', ''),
+                continue_prompt=self.config.get('continue_prompt', '')
+            )
+
+            if not generated_article:
+                self.log_signal.emit("Monica 未能生成文章。")
+                return False
+
+            self._save_article(title, generated_article)
+            return True
+        except Exception as e:
+            self.log_signal.emit(f"Monica 工作流程失败: {e}")
+            return False
+            
+    async def cleanup(self):
+        self.log_signal.emit("正在清理资源并关闭浏览器...")
+        if self.browser_manager:
+            try:
+                await self.browser_manager.cleanup()
+            except Exception as e:
+                self.log_signal.emit(f"浏览器关闭时出现警告（可忽略）: {e}")
+                # EPIPE错误是常见的，不应该影响整体流程
+        self.log_signal.emit("浏览器已关闭。")
+
+    def _load_titles_from_excel(self, file_path: str) -> List[str]:
+        if not file_path or not os.path.exists(file_path):
+            self.log_signal.emit(f"Excel文件路径无效或文件不存在: {file_path}")
+            return []
+        try:
+            # 读取完整的Excel文件
+            df = pd.read_excel(file_path, header=None)
+            
+            # 获取第一列的标题
+            titles = df[0].dropna().astype(str).tolist()
+            
+            # 检查是否有状态列，只处理未完成的任务
+            if len(df.columns) >= 2:
+                statuses = df[1].fillna('').astype(str).tolist()
+                # 创建待处理任务列表，包含索引信息
+                pending_tasks = []
+                for i, title in enumerate(titles):
+                    if i < len(statuses):
+                        status = statuses[i]
+                        if status != "已完成文章创作":
+                            pending_tasks.append((i, title))
+                    else:
+                        # 没有状态的任务视为待处理
+                        pending_tasks.append((i, title))
+                
+                # 保存任务索引映射
+                self.task_indices = [task[0] for task in pending_tasks]
+                titles = [task[1] for task in pending_tasks]
+                
+                self.log_signal.emit(f"从Excel文件加载 {len(titles)} 个待处理任务（跳过已完成任务）。")
+            else:
+                # 没有状态列，所有任务都是待处理的
+                self.task_indices = list(range(len(titles)))
+                self.log_signal.emit(f"从Excel文件成功加载 {len(titles)} 个标题。")
+            
+            # 保存Excel文件路径供后续更新状态使用
+            self.excel_file_path = file_path
+            return titles
+        except Exception as e:
+            self.log_signal.emit(f"读取Excel文件时发生错误: {e}")
+            return []
+
+    def _update_excel_status(self, task_index: int, status: str):
+        """更新Excel文件中对应行的状态"""
+        if not hasattr(self, 'excel_file_path') or not self.excel_file_path:
+            return
+        
+        try:
+            # 获取实际的Excel行索引
+            if hasattr(self, 'task_indices') and task_index < len(self.task_indices):
+                excel_row_index = self.task_indices[task_index]
+            else:
+                excel_row_index = task_index
+            
+            # 读取整个Excel文件
+            df = pd.read_excel(self.excel_file_path, header=None)
+            
+            # 确保第二列存在，如果不存在则创建
+            if len(df.columns) < 2:
+                df[1] = ''
+            
+            # 更新对应行的状态（第二列）
+            if excel_row_index < len(df):
+                df.iloc[excel_row_index, 1] = status
+                
+                # 保存回Excel文件
+                df.to_excel(self.excel_file_path, index=False, header=False)
+                self.log_signal.emit(f"已更新Excel状态: 第{excel_row_index + 1}行 -> {status}")
+            
+        except Exception as e:
+            self.log_signal.emit(f"更新Excel状态失败: {e}")
+
+    def _save_article(self, title: str, content: str):
+        save_path = self.config.get('save_path', '.')
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+            self.log_signal.emit(f"创建保存目录: {save_path}")
+
+        # 文件名处理
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '_')).rstrip()
+        filename = os.path.join(save_path, f"{safe_title}.md")
+
+        # 插入图片链接到二级标题后面
+        if os.path.exists('picture.txt'):
+            with open('picture.txt', 'r', encoding='utf-8') as f:
+                pictures_content = f.read().strip()
+            
+            if pictures_content:
+                # 将图片链接按行分割
+                picture_lines = [line.strip() for line in pictures_content.split('\n') if line.strip()]
+                
+                if picture_lines:
+                    content = self._insert_images_after_headings(content, picture_lines)
+                    self.log_signal.emit(f"已将 {len(picture_lines)} 张图片分别插入到二级标题后面。")
+                else:
+                    self.log_signal.emit("图片文件为空，未插入图片。")
+            else:
+                self.log_signal.emit("图片文件内容为空，未插入图片。")
+
+        # 保存文章
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.log_signal.emit(f"文章已成功保存到: {filename}")
+        except Exception as e:
+            self.log_signal.emit(f"保存文章失败: {e}")
+            traceback.print_exc()
+
+    def _insert_images_after_headings(self, content: str, picture_lines: List[str]) -> str:
+        """
+        将图片链接分别插入到二级标题后面
+        """
+        import re
+        
+        lines = content.split('\n')
+        result_lines = []
+        picture_index = 0
+        
+        for i, line in enumerate(lines):
+            result_lines.append(line)
+            
+            # 检查是否是二级标题（## 开头）
+            if line.strip().startswith('## ') and picture_index < len(picture_lines):
+                # 在二级标题后插入空行和图片
+                result_lines.append('')  # 空行
+                result_lines.append(picture_lines[picture_index])  # 图片链接
+                result_lines.append('')  # 空行
+                picture_index += 1
+        
+        # 如果还有剩余图片，插入到文章末尾
+        if picture_index < len(picture_lines):
+            result_lines.append('')  # 空行
+            result_lines.append('## 相关图片')  # 添加一个图片标题
+            result_lines.append('')  # 空行
+            for i in range(picture_index, len(picture_lines)):
+                result_lines.append(picture_lines[i])
+                result_lines.append('')  # 每张图片后空行
+        
+        return '\n'.join(result_lines)
+
+    def _clear_file(self, filename: str):
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+                self.log_signal.emit(f"已清理旧文件: {filename}")
+            except OSError as e:
+                self.log_signal.emit(f"清理文件 {filename} 失败: {e}") 

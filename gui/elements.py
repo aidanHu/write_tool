@@ -22,6 +22,10 @@ def get_elements(platforms=None, model_map=None):
         'enable_image_collect': QCheckBox('开启图片采集'),
         'image_count_label': QLabel('采集图片数量'),
         'image_count_spin': QSpinBox(),
+        'enable_custom_attachment': QCheckBox('上传自定义附件 (将覆盖文章采集)'),
+        'custom_attachment_path_label': QLabel('自定义附件路径'),
+        'custom_attachment_path_edit': QLineEdit(),
+        'custom_attachment_path_btn': QPushButton('选择附件'),
         'prompt_label': QLabel('创作提示词'),
         'prompt_edit': QTextEdit(),
         'min_word_count_label': QLabel('文章最少字数'),
@@ -31,6 +35,8 @@ def get_elements(platforms=None, model_map=None):
         'open_browser_btn': QPushButton('打开浏览器'),
         'start_btn': QPushButton('开始运行'),
         'headless_checkbox': QCheckBox('无头模式 (后台静默运行)'),
+        'log_output_label': QLabel('运行日志'),
+        'log_output': QTextEdit(),
     }
     # 选项初始化
     if platforms:
@@ -46,5 +52,7 @@ def get_elements(platforms=None, model_map=None):
     elements['continue_prompt_edit'].setMinimumWidth(400)
     elements['prompt_edit'].setMinimumHeight(60)
     elements['continue_prompt_edit'].setMinimumHeight(60)
-    elements['headless_checkbox'].setToolTip('勾选后，浏览器将不会显示界面，适合在服务器或需要稳定后台执行时使用。')
+    elements['headless_checkbox'].setToolTip('勾选后，浏览器将在后台静默运行，不会显示界面，完全避免抢占操作焦点。推荐在正式使用时启用此选项。')
+    elements['log_output'].setReadOnly(True)
+    elements['log_output'].setMinimumHeight(150)
     return elements 

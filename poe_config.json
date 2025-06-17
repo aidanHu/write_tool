@@ -1,83 +1,19 @@
 {
   "urls": {
-    "homepage": "https://poe.com/",
-    "login_page": "https://poe.com/login"
+    "homepage": "https://poe.com/"
   },
   "selectors": {
-    "login": {
-      "email_input": "//input[@type='email']",
-      "password_input": "//input[@type='password']",
-      "login_button": "button[data-testid='loginButton']",
-      "continue_button": "//button[contains(text(), 'Continue') or contains(text(), '继续')]",
-      "google_login": "//button[contains(text(), 'Google')]",
-      "captcha_frame": "//iframe[contains(@src, 'recaptcha')]"
-    },
     "chat": {
       "upload_button": "//button[@data-button-file-input='true']",
       "file_input": "//input[@type='file']",
       "chat_input": "//textarea[contains(@class, 'textArea')]",
       "send_button": "//button[@data-button-send='true']",
       "stop_button": "//button[.//span[text()='停止']]",
-      "last_response": "(//*[starts-with(@id, 'message-')]/div[2]/div[2]/div/div[1]/div/div)[last()]",
-      "typing_indicator": "//*[contains(@class, 'typing') or contains(text(), '正在输入')]"
-    },
-    "navigation": {
-      "new_chat_button": "//button[contains(text(), 'New chat') or contains(text(), '新对话')]",
-      "model_selector": "[data-testid='model-selector']",
-      "sidebar_toggle": "//button[contains(@class, 'sidebar-toggle')]"
+      "last_response": "(//*[starts-with(@id, 'message-')]/div[2]/div[2]/div/div[1]/div/div)[last()]"
     }
   },
   "timeouts": {
     "page_load": 30,
-    "element_wait": 15,
-    "login_wait": 30,
-    "ai_response_wait": 300,
-    "file_upload_wait": 60,
-    "typing_check_interval": 5,
-    "max_typing_checks": 60
-  },
-  "browser_options": {
-    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "window_size": "1920,1080",
-    "chrome_args": [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-web-security",
-      "--allow-running-insecure-content",
-      "--disable-extensions"
-    ],
-    "chrome_experimental_options": {
-      "excludeSwitches": ["enable-automation"],
-      "useAutomationExtension": false,
-      "prefs": {
-        "profile.default_content_setting_values.notifications": 2
-      }
-    }
-  },
-  "retry_config": {
-    "max_retries": 3,
-    "retry_delay": 2,
-    "login_retries": 3,
-    "upload_retries": 3,
-    "generation_retries": 2
-  },
-  "content_settings": {
-    "min_word_count": 800,
-    "max_generation_time": 300,
-    "word_count_check_interval": 10,
-    "supplement_prompt_template": "请继续完善上述内容，确保文章达到{min_words}字以上，内容要详细充实。"
-  },
-  "file_settings": {
-    "article_file": "article.txt",
-    "image_file": "picture.txt",
-    "supported_formats": [".txt", ".md", ".docx", ".pdf"],
-    "max_file_size": 10485760
-  },
-  "random_delays": {
-    "min_delay": 1,
-    "max_delay": 3,
-    "between_actions": true,
-    "typing_simulation": true
+    "ai_response_wait": 300
   }
 } 

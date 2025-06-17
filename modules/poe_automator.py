@@ -4,12 +4,13 @@ import json
 import logging
 import re
 from typing import Optional
+import asyncio
 
 from .browser_manager import BrowserManager
 
 
 class PoeAutomator:
-    """基于Chrome DevTools Protocol的POE自动化器"""
+    """基于Playwright的POE自动化器"""
 
     def __init__(self, gui_config: dict, browser_manager: BrowserManager, model_url: str):
         self.browser_manager = browser_manager
@@ -57,58 +58,58 @@ class PoeAutomator:
             self.logger.error(f"在配置中未找到选择器: '{name}'")
         return selector
 
-    def navigate_to_poe(self) -> bool:
+    async def navigate_to_poe(self) -> bool:
         """导航到在初始化时指定的模型URL"""
         try:
             self.logger.info(f"导航到: {self.model_url}")
-            if not self.browser_manager.navigate_to(self.model_url):
+            if not await self.browser_manager.navigate(self.model_url):
                 raise ConnectionError("浏览器导航失败")
             
-            self.browser_manager.close_other_tabs()
-            time.sleep(3)
+            await asyncio.sleep(2) # 等待页面初步加载
             
             chat_input_selector = self._get_selector('chat_input')
-            if not chat_input_selector or not self.browser_manager.wait_for_element(
-                chat_input_selector, self.timeouts.get('page_load', 30)
-            ):
+            if not chat_input_selector: return False
+
+            element = await self.browser_manager.find_element(
+                chat_input_selector, timeout=self.timeouts.get('page_load', 30)
+            )
+            if not element:
                 self.logger.error("导航后未能找到聊天输入框，页面可能未正确加载。")
                 return False
 
             self.logger.info("成功导航到POE页面并找到聊天输入框。")
             return True
         except Exception as e:
-            self.logger.error(f"导航到POE失败: {e}")
+            self.logger.error(f"导航到POE失败: {e}", exc_info=True)
             return False
 
-    def upload_file(self, file_path: str) -> bool:
+    async def upload_file(self, file_path: str) -> bool:
         """
-        直接为隐藏的input元素设置文件路径，绕过点击按钮。
+        使用BrowserManager为隐藏的input元素设置文件路径。
         """
         self.logger.info(f"开始直接上传文件: {file_path}")
         if not os.path.exists(file_path):
             self.logger.error(f"素材文件不存在: {file_path}")
             return False
 
-        try:
-            file_input_selector = self._get_selector('file_input')
-            if not file_input_selector:
-                return False
-
-            # 直接调用set_input_files，不再点击上传按钮
-            self.logger.info(f"正在直接为选择器 '{file_input_selector}' 设置文件...")
-            if not self.browser_manager.set_input_files(file_input_selector, file_path):
-                self.logger.error(f"使用set_input_files方法上传文件 '{file_path}' 失败。")
-                return False
-
-            self.logger.info(f"文件上传操作已提交: {file_path}")
-            # 使用一个合理的短等待时间，而不是从配置中读取可能很长的值
-            time.sleep(3)
-            return True
-        except Exception as e:
-            self.logger.error(f"上传文件时出现异常: {e}", exc_info=True)
+        file_input_selector = self._get_selector('file_input')
+        if not file_input_selector:
             return False
 
-    def send_prompt(self, prompt: str) -> bool:
+        self.logger.info(f"正在直接为选择器 '{file_input_selector}' 设置文件...")
+        success = await self.browser_manager.set_input_files_for_hidden_element(
+            file_input_selector, file_path
+        )
+
+        if success:
+            self.logger.info(f"文件上传操作已提交: {file_path}")
+            await asyncio.sleep(3) # 等待文件处理
+        else:
+            self.logger.error(f"为隐藏元素设置文件 '{file_path}' 失败。")
+
+        return success
+
+    async def send_prompt(self, prompt: str) -> bool:
         """在文本框中输入提示并点击发送。"""
         self.logger.info("开始发送提示...")
         try:
@@ -118,37 +119,17 @@ class PoeAutomator:
                 return False
 
             self.logger.info("正在输入提示文本...")
-            element = self.browser_manager.find_element(chat_input_selector)
-            if not element:
-                 self.logger.error(f"找不到聊天输入框: {chat_input_selector}")
+            if not await self.browser_manager.focus_and_type_text(chat_input_selector, prompt):
+                 self.logger.error(f"输入提示失败: {chat_input_selector}")
                  return False
-            
-            # 使用 type_text 进行输入，这里假设 browser_manager 有一个可以处理 xpath 的输入方法
-            # 如果没有，我们需要依赖JS注入
-            # 为了修复之前的语法错误，我们暂时使用一个更简单但可能较慢的方法
-            # self.browser_manager.type_text(element, prompt) 
-            # 鉴于 browser_manager 的 type_text 可能不兼容 xpath, 我们还是用JS，但保证语法正确
-
-            escaped_prompt = json.dumps(prompt)
-            # f-string的表达式部分不能包含反斜杠，所以我们先把替换操作拿出来
-            escaped_selector = chat_input_selector.replace('"', '\\"')
-            js_code = f"""
-            var ta = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (ta) {{
-                ta.value = {escaped_prompt};
-                ta.dispatchEvent(new Event('input', {{'bubbles': true}}));
-                ta.focus();
-            }}
-            """
-            self.browser_manager.execute_script(js_code)
-            
-            # 删除不必要的等待，实现即时发送
-            # time.sleep(1)
 
             self.logger.info(f"正在点击发送按钮: {send_button_selector}")
-            if not self.browser_manager.click_element_by_xpath(send_button_selector):
-                self.logger.error("点击发送按钮失败。")
+            send_button = await self.browser_manager.find_element(send_button_selector)
+            if not send_button or not await send_button.is_enabled():
+                self.logger.error("发送按钮未找到或不可用。")
                 return False
+            
+            await send_button.click()
 
             self.logger.info("提示已成功发送。")
             return True
@@ -156,7 +137,7 @@ class PoeAutomator:
             self.logger.error(f"发送提示时出现异常: {e}", exc_info=True)
             return False
 
-    def wait_for_generation_to_complete(self) -> bool:
+    async def wait_for_generation_to_complete(self) -> bool:
         """等待内容生成完成。"""
         self.logger.info("等待内容生成完成...")
         try:
@@ -164,157 +145,227 @@ class PoeAutomator:
             if not stop_button_selector:
                 return False
             
-            timeout = self.timeouts.get('ai_response_wait', 300)
-            check_interval = self.timeouts.get('typing_check_interval', 3)
+            timeout = self.timeouts.get('ai_response_wait', 300) * 1000 # 转换为毫秒
 
             self.logger.info("等待'停止'按钮出现...")
-            start_time = time.time()
-            stop_button_found = False
-            while time.time() - start_time < timeout:
-                if self.browser_manager.is_element_present(stop_button_selector):
-                    self.logger.info("'停止'按钮已出现，内容正在生成中。")
-                    stop_button_found = True
-                    break
-                time.sleep(check_interval)
+            stop_button = await self.browser_manager.find_element(stop_button_selector, timeout=15)
             
-            if not stop_button_found:
-                self.logger.warning("在超时时间内未检测到'停止'按钮，可能已秒速生成或未开始生成。继续后续步骤。")
+            if not stop_button:
+                self.logger.warning("在15秒内未检测到'停止'按钮，可能已秒速生成或未开始。继续。")
                 return True
 
+            self.logger.info("'停止'按钮已出现，内容正在生成中。")
             self.logger.info("等待'停止'按钮消失...")
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if not self.browser_manager.is_element_present(stop_button_selector):
-                    self.logger.info("'停止'按钮已消失，内容生成完成。")
-                    time.sleep(2)
-                    return True
-                time.sleep(check_interval)
+            
+            await stop_button.wait_for(state='hidden', timeout=timeout)
+            
+            self.logger.info("'停止'按钮已消失，内容生成完成。")
+            await asyncio.sleep(2) # 等待UI更新
+            return True
 
-            self.logger.error("超时！'停止'按钮长时间未消失，生成可能已卡住。")
-            return False
         except Exception as e:
             self.logger.error(f"等待生成完成时出现异常: {e}", exc_info=True)
             return False
 
-    def get_latest_response(self) -> Optional[str]:
+    async def get_latest_response(self) -> Optional[str]:
         """
-        获取最后一条机器人消息的HTML，并智能移除末尾的时间戳节点。
+        获取最后一条机器人消息的HTML，并转换为Markdown格式。
         """
-        self.logger.info("正在获取最新生成的内容 (HTML)，并尝试移除末尾的时间戳...")
+        self.logger.info("正在获取最新生成的内容...")
         try:
             response_selector = self._get_selector('last_response')
             if not response_selector:
                 return None
-
-            escaped_selector = response_selector.replace('"', '\\"')
             
-            # JS脚本在浏览器端直接操作DOM，寻找并移除只包含时间戳的最后一个子元素
-            js_script = f"""
-            (function() {{
-                var container = document.evaluate("{escaped_selector}", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                if (!container) {{ return null; }}
+            # 使用Playwright的locator来获取所有匹配的元素
+            response_elements = await self.browser_manager.find_elements(response_selector)
+            if not response_elements:
+                self.logger.warning(f"未能找到任何回复元素。选择器: {response_selector}")
+                return None
 
-                var lastElement = container.lastElementChild;
-                if (lastElement) {{
-                    // 正则表达式，用于匹配 "10:31" 或 "01:23:45" 这样的时间戳
-                    var timestampRegex = /^\\s*\\d{{1,2}}:\\d{{2}}(:\\d{{2}})?\\s*$/;
-                    if (timestampRegex.test(lastElement.innerText)) {{
-                        // 如果最后一个元素的文本内容是时间戳，则直接移除该元素
-                        lastElement.remove();
-                    }}
-                }}
+            # 获取最后一个元素
+            last_response_element = response_elements[-1]
+            
+            # 在最后一个元素上执行脚本，移除时间戳
+            js_script = """
+            (element) => {
+                if (!element) { return null; }
                 
-                // 返回清理后的HTML内容
-                return container.innerHTML;
-            }})()
+                var clonedElement = element.cloneNode(true);
+                var lastChild = clonedElement.lastElementChild;
+                if (lastChild) {
+                    var timestampRegex = /^\\s*\\d{1,2}:\\d{2}(:\\d{2})?\\s*$/;
+                    if (timestampRegex.test(lastChild.innerText)) {
+                        lastChild.remove();
+                    }
+                }
+                return clonedElement.innerHTML;
+            }
             """
             
-            for _ in range(3):
-                html_content = self.browser_manager.execute_script(js_script)
-                if html_content and html_content.strip():
-                    self.logger.info(f"成功获取并清理了HTML内容，长度为 {len(html_content)}。")
-                    return html_content
-                time.sleep(1)
+            html_content = await last_response_element.evaluate(js_script)
 
-            self.logger.warning(f"未能获取到最新回复的HTML内容，或内容为空。选择器: {response_selector}")
+            if html_content and html_content.strip():
+                # 将HTML转换为Markdown
+                from markdownify import markdownify as md
+                markdown_content = md(html_content, heading_style="ATX")
+                
+                # 清理多余的空行
+                import re
+                markdown_content = re.sub(r'\n\s*\n\s*\n', '\n\n', markdown_content)
+                markdown_content = markdown_content.strip()
+                
+                self.logger.info(f"成功获取并转换内容为Markdown，长度为 {len(markdown_content)} 字符。")
+                return markdown_content
+
+            self.logger.warning(f"未能获取到最新回复的HTML内容，或内容为空。")
             return None
         except Exception as e:
             self.logger.error(f"获取最新回复时出现异常: {e}", exc_info=True)
             return None
 
-    def generate_content(self, prompt: str, article_file: Optional[str] = None) -> Optional[str]:
+    async def generate_content(self, prompt: str, article_file: Optional[str] = None) -> Optional[str]:
         """
         执行完整的Poe文章生成工作流。
-        现在接收prompt作为参数，并且article_file是可选的。
         """
         self.logger.info(f"--- 开始Poe内容生成工作流 ---")
-        self.logger.info(f"提示: {prompt}")
-
-        if not self.navigate_to_poe():
+        
+        # 1. 导航
+        if not await self.navigate_to_poe():
             return None
 
-        # 如果提供了文章路径，则执行上传
-        if article_file and os.path.exists(article_file):
-            self.logger.info(f"素材文件: {article_file}")
-            if not self.upload_file(article_file):
-                # 上传失败是一个严重问题，应该中止
-                self.logger.error("文章上传失败，中止本次任务。")
+        # 2. 如果有文件，上传文件
+        if article_file:
+            if not await self.upload_file(article_file):
+                self.logger.error("文件上传失败，工作流终止。")
                 return None
-        else:
-            self.logger.info("未提供文章附件或文件不存在，将直接根据提示进行创作。")
-            
-        if not self.send_prompt(prompt):
-            return None
-
-        if not self.wait_for_generation_to_complete():
-            return None
-
-        content = self.get_latest_response()
         
-        if content:
-            self.logger.info("--- Poe内容生成工作流成功结束 ---")
-        else:
-            self.logger.error("--- Poe内容生成工作流结束，但未能获取到内容 ---")
-            
-        return content
+        # 3. 发送提示词
+        if not await self.send_prompt(prompt):
+            return None
 
-    def continue_generation(self, prompt: str) -> Optional[str]:
+        # 4. 等待生成完成
+        if not await self.wait_for_generation_to_complete():
+            return None
+
+        # 5. 获取最终响应
+        return await self.get_latest_response()
+
+    async def continue_generation(self, prompt: str) -> Optional[str]:
         """
-        用于在已有对话中继续生成内容（二次创作）。
+        继续生成内容
         """
-        self.logger.info("--- 开始二次创作 ---")
-        self.logger.info(f"二次创作提示: {prompt}")
-
-        if not self.send_prompt(prompt):
+        self.logger.info(f"--- 开始Poe继续生成工作流 ---")
+        
+        # 1. 发送提示词
+        if not await self.send_prompt(prompt):
             return None
 
-        if not self.wait_for_generation_to_complete():
+        # 2. 等待生成完成
+        if not await self.wait_for_generation_to_complete():
             return None
-        
-        content = self.get_latest_response()
-        if content:
-            self.logger.info("--- 二次创作成功结束 ---")
-        else:
-            self.logger.error("--- 二次创作结束，但未能获取到内容 ---")
-        
-        return content
+
+        # 3. 获取最终响应
+        return await self.get_latest_response()
 
     def save_content(self, markdown_content: str, output_file: str) -> bool:
-        """将最终的Markdown内容保存到指定文件。"""
-        if not markdown_content:
-            self.logger.error("没有内容可保存。")
-            return False
+        """保存内容到文件"""
+        self.logger.info(f"正在保存内容到: {output_file}")
         try:
-            output_dir = os.path.dirname(output_file)
-            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
-            self.logger.info(f"内容已成功保存到: {output_file}")
+            self.logger.info("内容保存成功。")
             return True
         except Exception as e:
-            self.logger.error(f"保存Markdown内容时出错: {e}", exc_info=True)
+            self.logger.error(f"保存文件失败: {e}", exc_info=True)
             return False
 
-    def cleanup(self):
-        """清理资源（如果需要）"""
-        self.logger.info("PoeAutomator清理完成。") 
+    async def compose_article(self, title: str, attachment_path: Optional[str] = None, 
+                            min_words: int = 800, prompt: str = '', continue_prompt: str = '') -> Optional[str]:
+        """
+        完整的文章创作流程，包括上传附件、发送提示、等待生成、检查字数、继续生成等
+        """
+        self.logger.info(f"开始为标题 '{title}' 创作文章...")
+        
+        try:
+            # 1. 导航到POE
+            if not await self.navigate_to_poe():
+                self.logger.error("导航到POE失败")
+                return None
+            
+            # 2. 上传附件（如果有）
+            if attachment_path:
+                if os.path.exists(attachment_path):
+                    self.logger.info(f"开始上传附件: {attachment_path}")
+                    if not await self.upload_file(attachment_path):
+                        self.logger.warning("附件上传失败，继续进行文章创作")
+                    else:
+                        self.logger.info("附件上传成功")
+                else:
+                    self.logger.warning(f"附件文件不存在: {attachment_path}")
+            
+            # 3. 构建提示词：直接使用用户提示词 + 标题
+            if prompt:
+                full_prompt = f"{prompt} 标题：{title}"
+            else:
+                full_prompt = f"请写一篇文章，标题：{title}"
+            
+            # 4. 发送提示词并生成内容
+            if not await self.send_prompt(full_prompt):
+                self.logger.error("发送提示词失败")
+                return None
+            
+            if not await self.wait_for_generation_to_complete():
+                self.logger.error("等待生成完成失败")
+                return None
+            
+            # 5. 获取生成的内容
+            content = await self.get_latest_response()
+            if not content:
+                self.logger.error("获取生成内容失败")
+                return None
+            
+            # 6. 检查字数，如果不够则继续生成
+            word_count = len(content.replace(' ', '').replace('\n', ''))
+            self.logger.info(f"初次生成内容字数: {word_count}")
+            
+            if word_count < min_words and continue_prompt:
+                self.logger.info(f"字数不足{min_words}字，开始继续生成...")
+                
+                # 发送继续生成的提示
+                continue_full_prompt = continue_prompt or f"请继续完善上述内容，确保文章达到{min_words}字以上。"
+                
+                if not await self.send_prompt(continue_full_prompt):
+                    self.logger.warning("发送继续生成提示失败，返回当前内容")
+                    return content
+                
+                if not await self.wait_for_generation_to_complete():
+                    self.logger.warning("等待继续生成完成失败，返回当前内容")
+                    return content
+                
+                # 获取继续生成的内容
+                additional_content = await self.get_latest_response()
+                if additional_content:
+                    # 合并内容
+                    content = content + "\n\n" + additional_content
+                    final_word_count = len(content.replace(' ', '').replace('\n', ''))
+                    self.logger.info(f"继续生成后总字数: {final_word_count}")
+            
+            final_word_count = len(content.replace(' ', '').replace('\n', ''))
+            self.logger.info(f"文章创作完成，最终字数: {final_word_count}")
+            return content
+            
+        except Exception as e:
+            self.logger.error(f"文章创作过程中出现错误: {e}", exc_info=True)
+            return None
+
+    async def cleanup(self):
+        """执行清理操作"""
+        self.logger.info("PoeAutomator正在执行清理操作...")
+        if self.browser_manager:
+            try:
+                await self.browser_manager.cleanup()
+            except Exception as e:
+                self.logger.warning(f"浏览器清理时出现警告（可忽略）: {e}")
+                # EPIPE等错误是正常的清理过程，不应该抛出异常 

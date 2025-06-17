@@ -48,30 +48,8 @@
     "search_delay": 5,
     "article_delay": 2
   },
-  "browser_options": {
-    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "window_size": "1920,1080",
-    "chrome_args": [
-      "--no-sandbox",
-      "--disable-dev-shm-usage", 
-      "--disable-blink-features=AutomationControlled",
-      "--disable-web-security",
-      "--allow-running-insecure-content",
-      "--disable-extensions",
-      "--disable-gpu"
-    ],
-    "chrome_experimental_options": {
-      "excludeSwitches": ["enable-automation"],
-      "useAutomationExtension": false
-    }
-  },
-  "retry_config": {
-    "max_retries": 3,
-    "retry_delay": 2,
-    "page_load_retries": 3,
-    "search_retries": 3,
-    "content_extract_retries": 2
-  },
+
+
   "scraping": {
     "max_articles": 10,
     "max_pages": 3,
@@ -80,10 +58,23 @@
     "content_min_length": 100,
     "crop_bottom_pixels": 90
   },
-  "random_delays": {
-    "min_delay": 1,
-    "max_delay": 2,
-    "between_articles": true,
-    "between_pages": true
+
+  "verification": {
+    "selectors": [
+      "iframe[src*='captcha']",
+      "iframe[src*='verify']",
+      ".captcha",
+      "#captcha",
+      "[class*='verify']",
+      "[class*='captcha']",
+      "//div[contains(text(), '验证')]",
+      "//div[contains(text(), '人机验证')]",
+      "//div[contains(text(), '安全验证')]",
+      "//div[contains(text(), '请完成验证')]",
+      "//button[contains(text(), '点击验证')]",
+      "//div[contains(@class, 'slider')]",
+      ".geetest_holder",
+      "#geetest_holder"
+    ]
   }
 } 

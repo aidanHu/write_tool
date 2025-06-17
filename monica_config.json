@@ -1,4 +1,7 @@
 {
+    "urls": {
+        "homepage": "https://monica.im/"
+    },
     "selectors": {
         "chat": {
             "chat_input": "//textarea[@data-input_node='monica-chat-input' and not(@style[contains(., 'display: none')]) and not(ancestor::*[contains(@style, 'display: none')])]",
@@ -10,9 +13,8 @@
         }
     },
     "timeouts": {
-        "page_load": 60,
-        "ai_response_wait": 600,
-        "typing_check_interval": 3
-    },
-    "urls": {}
+        "navigation": 30,
+        "response": 60,
+        "generation": 120
+    }
 } 

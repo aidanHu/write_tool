@@ -27,3 +27,5 @@ picture.txt
 *.txt
 /gui/__pycache__
 picture.txt
+/gui/__pycache__
+/playwright_chrome_profile

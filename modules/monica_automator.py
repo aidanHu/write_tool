@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Optional, Any
 import copy
+import asyncio
+from playwright.async_api import async_playwright, Playwright
 
 from .browser_manager import BrowserManager
 
@@ -92,63 +94,58 @@ class MonicaAutomator:
             self.logger.error(f"获取选择器 '{key}' 时出错: {e}")
             return None
 
-    def navigate_to_monica(self) -> bool:
+    async def navigate_to_monica(self) -> bool:
         """导航到Monica页面并等待聊天输入框加载"""
         self.logger.info(f"导航到Monica页面: {self.model_url}")
-        self.browser_manager.navigate(self.model_url)
+        await self.browser_manager.navigate(self.model_url)
         
         if not self.chat_input_selector:
             self.logger.error("无法获取聊天输入框选择器，初始化失败。")
             return False
 
         self.logger.info("等待聊天输入框出现...")
-        if self.browser_manager.wait_for_element_by_xpath(
+        element = await self.browser_manager.find_element(
             self.chat_input_selector, timeout=self.timeouts.get('navigation', 30)
-        ):
+        )
+        if element:
             self.logger.info("成功导航到Monica页面并找到聊天输入框。")
             return True
         else:
             self.logger.error("导航后未能找到聊天输入框，页面可能未正确加载。")
             return False
 
-    def send_prompt(self, prompt: str) -> bool:
+    async def send_prompt(self, prompt: str) -> bool:
         """
         输入提示并发送。
         """
-        if not self.chat_input_selector or not self.send_button_selector:
-            self.logger.error("配置中缺少'chat_input_selector'或'send_button_selector'。")
+        if not self.chat_input_selector:
+            self.logger.error("配置中缺少'chat_input_selector'。")
             return False
 
         self.logger.info("正在输入提示...")
         
-        # 首先尝试使用新的JavaScript输入方法
-        input_success = self.browser_manager.input_text_by_xpath_js(
-            self.chat_input_selector, prompt
+        # 使用精简后的BrowserManager方法
+        input_success = await self.browser_manager.focus_and_type_text(
+            self.chat_input_selector, prompt, clear_first=True
         )
-        
-        # 如果JavaScript方法失败，回退到原来的方法
-        if not input_success:
-            self.logger.warning("JavaScript输入方法失败，回退到传统方法...")
-            input_success = self.browser_manager.focus_and_type_text(
-                self.chat_input_selector, prompt, clear_first=True
-            )
 
         if not input_success:
             self.logger.error("输入提示文本失败。")
             return False
 
         self.logger.info("提示输入成功，准备通过模拟回车键发送。")
-
-        press_enter_success = self.browser_manager.press_enter_on_xpath(self.chat_input_selector)
-
-        if not press_enter_success:
-            self.logger.error("模拟回车键失败。")
+        
+        # 直接在找到的元素上按回车
+        input_element = await self.browser_manager.find_element(self.chat_input_selector)
+        if not input_element:
+            self.logger.error("无法重新定位输入框以按回车。")
             return False
 
+        await input_element.press('Enter')
         self.logger.info("提示已成功发送。")
         return True
 
-    def get_response(self) -> Optional[str]:
+    async def get_response(self) -> Optional[str]:
         """
         获取并返回生成的响应文本。
         """
@@ -159,7 +156,14 @@ class MonicaAutomator:
         self.logger.info("正在等待并获取最终响应...")
         
         try:
-            self.browser_manager.wait_for_element_by_xpath(self.response_container_selector, timeout=self.timeouts.get('response', 60))
+            # 直接等待元素出现
+            response_element = await self.browser_manager.find_element(
+                self.response_container_selector, 
+                timeout=self.timeouts.get('response', 60)
+            )
+            if not response_element:
+                self.logger.error("等待响应容器超时。")
+                return None
         except Exception as e:
             self.logger.error(f"等待响应容器时出错: {e}")
             return None
@@ -185,7 +189,7 @@ class MonicaAutomator:
         }})()
         """
         
-        response_text = self.browser_manager.execute_script(js_script)
+        response_text = await self.browser_manager.execute_script(js_script)
         
         if response_text:
             self.logger.info(f"成功提取响应内容，长度: {len(response_text)} 字符")
@@ -199,28 +203,29 @@ class MonicaAutomator:
             self.logger.error("未能提取响应文本。")
             return None
 
-    def wait_for_generation_to_complete(self) -> bool:
+    async def wait_for_generation_to_complete(self) -> bool:
         """等待内容生成完成（通过检测停止按钮是否消失）。"""
         if not self.stop_generating_button_selector:
             self.logger.error("未找到停止按钮选择器，无法判断生成状态。")
             return False
 
-        timeout = self.timeouts.get('generation', 120)
-        self.logger.info(f"等待'停止生成'按钮出现 (最长 {timeout} 秒)...")
+        timeout = self.timeouts.get('generation', 120) * 1000  # 转换为毫秒
+        self.logger.info(f"等待'停止生成'按钮出现 (最长 {timeout / 1000} 秒)...")
         
-        appeared = self.browser_manager.wait_for_element_by_xpath(self.stop_generating_button_selector, timeout=20)
-        if not appeared:
+        stop_button = await self.browser_manager.find_element(self.stop_generating_button_selector, timeout=20)
+        
+        if not stop_button:
             self.logger.warning("'停止生成'按钮在20秒内未出现，可能生成已瞬间完成或未开始。将直接认为生成已结束。")
             return True
 
         self.logger.info("'停止生成'按钮已出现，现在等待它消失...")
         
-        disappeared = self.browser_manager.wait_for_element_to_disappear_by_xpath(self.stop_generating_button_selector, timeout=timeout)
-        if disappeared:
+        try:
+            await stop_button.wait_for(state='hidden', timeout=timeout)
             self.logger.info("'停止生成'按钮已消失，内容生成完毕。")
             return True
-        else:
-            self.logger.error(f"'停止生成'按钮在 {timeout} 秒后仍未消失。")
+        except Exception:
+            self.logger.error(f"'停止生成'按钮在 {timeout / 1000} 秒后仍未消失。")
             return False
 
     def save_response_to_file(self, response: str, output_path: str):
@@ -232,137 +237,110 @@ class MonicaAutomator:
         except Exception as e:
             self.logger.error(f"保存响应到文件时出错: {e}")
             
-    def generate_content(self, prompt: str, article_file: Optional[str] = None) -> Optional[str]:
+    async def generate_content(self, prompt: str, article_file: Optional[str] = None) -> Optional[str]:
         """
         执行完整的Monica文章生成工作流。
         这是被 WorkflowManager 调用的主入口方法。
         """
         self.logger.info("--- 开始Monica内容生成工作流 ---")
         
-        if not self.navigate_to_monica():
+        if not await self.navigate_to_monica():
             self.logger.error("导航失败，工作流终止。")
             return None
 
-        # 文件上传步骤 (当前逻辑是跳过，因为没有直接的文件上传input)
+        # 文件上传步骤
         if article_file:
-            self.logger.info(f"接收到文件 '{article_file}'，但当前实现中将跳过上传步骤。")
-            # if not self.upload_file(article_file):
-            #     return None
+            self.logger.info(f"接收到文件 '{article_file}'，正在尝试上传...")
+            if await self.upload_file(article_file):
+                self.logger.info("✅ 文件上传成功，等待文件处理完成...")
+                # 等待文件上传和处理完成
+                await asyncio.sleep(3)
+                
+                # 再次检查文件是否真的上传成功
+                file_name = os.path.basename(article_file)
+                check_script = f"""
+                    (function() {{
+                        try {{
+                            var pageText = document.body.textContent || '';
+                            return pageText.includes('{file_name}');
+                        }} catch (error) {{
+                            console.log('❌ 检查文件状态出错: ' + error.message);
+                            return false;
+                        }}
+                    }})()
+                """
+                
+                file_confirmed = await self.browser_manager.execute_script(check_script)
+                if file_confirmed:
+                    self.logger.info("✅ 文件上传确认成功，可以继续发送提示词")
+                else:
+                    self.logger.warning("⚠️ 文件上传状态不确定，但继续执行")
+            else:
+                self.logger.warning("⚠️ 文件上传失败，但继续执行工作流...")
+                # 不返回None，允许工作流继续
         
         # 记录即将发送的提示词（用于调试）
         self.logger.info(f"准备发送的提示词长度: {len(prompt)} 字符")
         self.logger.info(f"提示词前200字符: {prompt[:200]}...")
         
         # 发送主提示词
-        if not self.send_prompt(prompt):
+        if not await self.send_prompt(prompt):
             self.logger.error("发送提示失败，工作流终止。")
             return None
             
         # 等待生成完成
-        if not self.wait_for_generation_to_complete():
+        if not await self.wait_for_generation_to_complete():
             self.logger.error("等待生成完成失败，工作流终止。")
             return None
             
         # 获取最终的响应
         self.logger.info("工作流完成，正在获取最终响应。")
-        response = self.get_response()
+        response = await self.get_response()
         
         # 返回的是HTML或文本，WorkflowManager会处理后续的保存
         return response
 
-    def continue_generation(self, continue_prompt: str) -> Optional[str]:
+    async def continue_generation(self, continue_prompt: str) -> Optional[str]:
         """
         继续生成内容（用于字数不足时的二次创作）
         """
         self.logger.info("--- 开始Monica继续生成工作流 ---")
         
         # 发送继续提示词
-        if not self.send_prompt(continue_prompt):
+        if not await self.send_prompt(continue_prompt):
             self.logger.error("发送继续提示失败。")
             return None
             
         # 等待生成完成
-        if not self.wait_for_generation_to_complete():
+        if not await self.wait_for_generation_to_complete():
             self.logger.error("等待继续生成完成失败。")
             return None
             
         # 获取最终的响应
-        response = self.get_response()
+        response = await self.get_response()
         self.logger.info("继续生成完成。")
         
         return response
 
-    # --- 文件上传相关方法 (当前未使用) ---
-    def upload_file(self, file_path: str) -> bool:
-        if not os.path.exists(file_path):
-            self.logger.error(f"文件不存在，无法上传: {file_path}")
+    # --- 文件上传相关方法 ---
+    async def upload_file(self, file_path: str) -> bool:
+        """使用新的BrowserManager方法上传文件。"""
+        absolute_path = os.path.abspath(file_path)
+        if not os.path.exists(absolute_path):
+            self.logger.error(f"文件不存在，无法上传: {absolute_path}")
             return False
 
-        upload_button_selector = self._get_selector('upload_button')
-        if not upload_button_selector:
+        if not self.upload_button_selector:
+            self.logger.error("配置中缺少 'upload_button' 选择器。")
             return False
 
-        self.logger.info(f"尝试上传文件: {file_path}")
-        
-        # 此处需要一个能够在headless模式下工作的、不依赖原生文件选择对话框的上传方法
-        # 这通常需要执行JS来创建一个隐藏的<input type="file">元素或使用网站提供的JS接口
-        # 以下是一个示例性的JS注入，需要根据实际情况调整
-        
-        # 读取文件内容为base64
-        try:
-            with open(file_path, 'rb') as f:
-                file_content_base64 = base64.b64encode(f.read()).decode('utf-8')
-            file_name = os.path.basename(file_path)
-        except Exception as e:
-            self.logger.error(f"读取文件内容为Base64时出错: {e}")
-            return False
+        self.logger.info(f"📁 开始上传文件: {file_path}")
+        self.logger.info(f"使用上传按钮选择器: {self.upload_button_selector}")
 
-        # JS注入来处理文件
-        js_script = f"""
-        async function(base64Content, fileName) {{
-            try {{
-                // Base64 to Blob
-                const res = await fetch(`data:application/octet-stream;base64,${{base64Content}}`);
-                const blob = await res.blob();
-                
-                // Create a File object
-                const file = new File([blob], fileName, {{ type: blob.type }});
-
-                // Create a DataTransfer object and add the file
-                const dataTransfer = new DataTransfer();
-                dataTransfer.items.add(file);
-
-                // Find the target element to dispatch the drop event
-                // This might be the document, body, or a specific drop zone
-                const dropZone = document.body; // Or a more specific element
-
-                // Create and dispatch the drop event
-                const dropEvent = new DragEvent('drop', {{
-                    dataTransfer: dataTransfer,
-                    bubbles: true,
-                    cancelable: true
-                }});
-                dropZone.dispatchEvent(dropEvent);
-                
-                return {{ success: true }};
-            }} catch (e) {{
-                return {{ success: false, error: e.toString() }};
-            }}
-        }}
-        """
-        
-        try:
-            result = self.browser_manager.execute_async_script(js_script, file_content_base64, file_name)
-            if result and result.get('success'):
-                self.logger.info("JS文件上传脚本执行成功。")
-                return True
-            else:
-                error_msg = result.get('error', '未知JS错误') if result else "JS脚本未返回结果"
-                self.logger.error(f"JS文件上传脚本执行失败: {error_msg}")
-                return False
-        except Exception as e:
-            self.logger.error(f"执行JS文件上传脚本时发生Python异常: {e}")
-            return False
+        # 直接调用新的、职责明确的方法
+        return await self.browser_manager.upload_file_with_dialog(
+            self.upload_button_selector, absolute_path
+        )
 
     def save_content(self, markdown_content: str, output_file: str) -> bool:
         """保存内容到文件"""
@@ -377,40 +355,132 @@ class MonicaAutomator:
             self.logger.error(f"保存文件失败: {e}", exc_info=True)
             return False
 
-    def cleanup(self):
+    async def compose_article(self, title: str, attachment_path: Optional[str] = None, 
+                            min_words: int = 800, prompt: str = '', continue_prompt: str = '') -> Optional[str]:
+        """
+        完整的文章创作流程，包括上传附件、发送提示、等待生成、检查字数、继续生成等
+        """
+        self.logger.info(f"开始为标题 '{title}' 创作文章...")
+        
+        try:
+            # 1. 导航到Monica
+            if not await self.navigate_to_monica():
+                self.logger.error("导航到Monica失败")
+                return None
+            
+            # 2. 上传附件（如果有）
+            if attachment_path:
+                if os.path.exists(attachment_path):
+                    self.logger.info(f"开始上传附件: {attachment_path}")
+                    if not await self.upload_file(attachment_path):
+                        self.logger.warning("附件上传失败，继续进行文章创作")
+                    else:
+                        self.logger.info("附件上传成功")
+                        # 等待文件处理完成
+                        await asyncio.sleep(3)
+                else:
+                    self.logger.warning(f"附件文件不存在: {attachment_path}")
+            
+            # 3. 构建提示词：直接使用用户提示词 + 标题
+            if prompt:
+                full_prompt = f"{prompt} 标题：{title}"
+            else:
+                full_prompt = f"请写一篇文章，标题：{title}"
+            
+            # 4. 发送提示词并生成内容
+            if not await self.send_prompt(full_prompt):
+                self.logger.error("发送提示词失败")
+                return None
+            
+            if not await self.wait_for_generation_to_complete():
+                self.logger.error("等待生成完成失败")
+                return None
+            
+            # 5. 获取生成的内容
+            content = await self.get_response()
+            if not content:
+                self.logger.error("获取生成内容失败")
+                return None
+            
+            # 6. 将HTML转换为Markdown（如果需要）
+            if '<' in content and '>' in content:
+                # 看起来是HTML，转换为Markdown
+                from markdownify import markdownify as md
+                content = md(content, heading_style="ATX")
+                # 清理多余的空行
+                import re
+                content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
+                content = content.strip()
+            
+            # 7. 检查字数，如果不够则继续生成
+            word_count = len(content.replace(' ', '').replace('\n', ''))
+            self.logger.info(f"初次生成内容字数: {word_count}")
+            
+            if word_count < min_words and continue_prompt:
+                self.logger.info(f"字数不足{min_words}字，开始继续生成...")
+                
+                # 发送继续生成的提示
+                continue_full_prompt = continue_prompt or f"请继续完善上述内容，确保文章达到{min_words}字以上。"
+                
+                if not await self.send_prompt(continue_full_prompt):
+                    self.logger.warning("发送继续生成提示失败，返回当前内容")
+                    return content
+                
+                if not await self.wait_for_generation_to_complete():
+                    self.logger.warning("等待继续生成完成失败，返回当前内容")
+                    return content
+                
+                # 获取继续生成的内容
+                additional_content = await self.get_response()
+                if additional_content:
+                    # 将HTML转换为Markdown（如果需要）
+                    if '<' in additional_content and '>' in additional_content:
+                        additional_content = md(additional_content, heading_style="ATX")
+                        additional_content = re.sub(r'\n\s*\n\s*\n', '\n\n', additional_content)
+                        additional_content = additional_content.strip()
+                    
+                    # 合并内容
+                    content = content + "\n\n" + additional_content
+                    final_word_count = len(content.replace(' ', '').replace('\n', ''))
+                    self.logger.info(f"继续生成后总字数: {final_word_count}")
+            
+            final_word_count = len(content.replace(' ', '').replace('\n', ''))
+            self.logger.info(f"文章创作完成，最终字数: {final_word_count}")
+            return content
+            
+        except Exception as e:
+            self.logger.error(f"文章创作过程中出现错误: {e}", exc_info=True)
+            return None
+
+    async def cleanup(self):
         """执行清理操作"""
         self.logger.info("MonicaAutomator执行清理操作...")
-        # 当前没有需要特别清理的资源
-        pass 
+        if self.browser_manager:
+            await self.browser_manager.cleanup()
 
-    def close(self):
-        self.logger.info("MonicaAutomator执行清理操作...")
-        # 当前没有需要特别清理的资源
-        pass 
-
-    def run_automation(self, title: str, article: str, output_path: str) -> bool:
+    async def run_automation(self, title: str, article: str, output_path: str) -> bool:
         """执行完整的Monica自动化流程"""
         try:
             self.logger.info("开始Monica自动化流程...")
-            if not self.navigate_to_monica():
+            if not await self.navigate_to_monica():
                 return False
 
             prompt = f"{article}\n\n主题：{title}"
             
             self.logger.info("第二步：发送提示...")
-            if not self.send_prompt(prompt):
+            if not await self.send_prompt(prompt):
                 self.logger.error("发送提示失败。")
                 return False
             self.logger.info("提示发送成功。")
 
             self.logger.info("第三步：等待内容生成完成...")
-            if not self.wait_for_generation_to_complete():
+            if not await self.wait_for_generation_to_complete():
                 self.logger.error("等待生成完成时超时或失败。")
                 return False
             self.logger.info("内容生成完成。")
 
             self.logger.info("第四步：获取并保存响应...")
-            response = self.get_response()
+            response = await self.get_response()
             if response:
                 self.save_response_to_file(response, output_path)
                 self.logger.info(f"成功获取响应并保存到 {output_path}")
@@ -423,4 +493,4 @@ class MonicaAutomator:
             self.logger.error(f"Monica自动化流程发生未预料的错误: {e}", exc_info=True)
             return False
         finally:
-            self.close()
+            await self.cleanup()
